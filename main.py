@@ -8,6 +8,9 @@ from langchain_community.utilities import SQLDatabase
 from langchain_experimental.sql import SQLDatabaseChain
 from dotenv import load_dotenv
 
+# Import DB documentation context
+from context import DB_SCHEMA_DOC
+
 # Load .env file
 load_dotenv()
 
@@ -23,7 +26,22 @@ llm = ChatOpenAI(model="gpt-4o", temperature=0, openai_api_key=OPENAI_API_KEY)
 
 # Supabase (Postgres) DB connection
 engine = create_engine(SUPABASE_DB_URL, pool_pre_ping=True)
-db = SQLDatabase(engine)
+
+# Restrict DB access ONLY to documented tables/views
+allowed_tables = [
+    "public.energy_balance_long",
+    "public.entities",
+    "public.monthly_cpi_mv",
+    "public.price_with_usd",
+    "public.tariff_with_usd",
+    "public.tech_quantity_view",
+    "public.trade",
+    "public.trade_derived_entities",
+    "public.trade_by_type",
+    "public.trade_by_source",
+    "public.trade_by_ownership"
+]
+db = SQLDatabase(engine, include_tables=allowed_tables)
 
 # SQL Chain
 db_chain = SQLDatabaseChain.from_llm(
@@ -46,8 +64,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-SYSTEM_PROMPT = """You are a data assistant.
+SYSTEM_PROMPT = f"""You are a data assistant.
 You must ONLY answer using the SQL query results from the database.
+Use the following schema documentation for context:
+{DB_SCHEMA_DOC}
+
 If results are empty or insufficient, reply exactly: "I don’t know based on the data."
 Never use outside knowledge.
 """
