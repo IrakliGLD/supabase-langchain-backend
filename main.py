@@ -1,5 +1,5 @@
 import os
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy import create_engine, text
@@ -17,12 +17,10 @@ load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 SUPABASE_DB_URL = os.getenv("SUPABASE_DB_URL")
 ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*")
+APP_SECRET_KEY = os.getenv("APP_SECRET_KEY")
 
 if not OPENAI_API_KEY or not SUPABASE_DB_URL:
     raise RuntimeError("Missing OPENAI_API_KEY or SUPABASE_DB_URL in environment")
-
-# GPT-4o LLM
-llm = ChatOpenAI(model="gpt-4o", temperature=0, openai_api_key=OPENAI_API_KEY)
 
 # Supabase (Postgres) DB connection
 engine = create_engine(SUPABASE_DB_URL, pool_pre_ping=True)
@@ -39,19 +37,10 @@ allowed_tables = [
 ]
 db = SQLDatabase(engine, include_tables=allowed_tables)
 
-# SQL Chain
-db_chain = SQLDatabaseChain.from_llm(
-    llm=llm,
-    db=db,
-    verbose=True,
-    use_query_checker=True,
-    top_k=50
-)
-
 # FastAPI app
 app = FastAPI(title="Supabase LangChain Backend")
 
-# CORS settings
+# CORS settings (open for now)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[ALLOWED_ORIGINS] if ALLOWED_ORIGINS != "*" else ["*"],
@@ -60,9 +49,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Updated system prompt
 SYSTEM_PROMPT = f"""You are a data assistant.
 You must ONLY answer using the SQL query results from the database.
-Use the following schema documentation for context:
+
+⚠️ Important rules:
+- NEVER wrap queries in markdown fences (no ```sql or ```).
+- Return only clean SQL when generating queries.
+- Use the following schema documentation for context:
 {DB_SCHEMA_DOC}
 
 If results are empty or insufficient, reply exactly: "I don’t know based on the data."
@@ -71,6 +65,10 @@ Never use outside knowledge.
 
 class Question(BaseModel):
     query: str
+
+def clean_sql(query: str) -> str:
+    """Remove markdown fences if GPT accidentally adds them."""
+    return query.replace("```sql", "").replace("```", "").strip()
 
 @app.get("/healthz")
 def health():
@@ -90,9 +88,27 @@ def introspect():
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/ask")
-def ask(q: Question):
+def ask(q: Question, x_app_key: str = Header(...)):
+    # 🔒 API Key Authentication
+    if not APP_SECRET_KEY or x_app_key != APP_SECRET_KEY:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
     try:
+        # Always use server's own OpenAI key
+        llm = ChatOpenAI(model="gpt-4o", temperature=0, openai_api_key=OPENAI_API_KEY)
+        db_chain = SQLDatabaseChain.from_llm(
+            llm=llm,
+            db=db,
+            verbose=True,
+            use_query_checker=True,
+            top_k=50
+        )
+
         result = db_chain.run(SYSTEM_PROMPT + "\n\n" + q.query)
+
+        if isinstance(result, str):
+            result = clean_sql(result)
+
         return {"answer": result}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
