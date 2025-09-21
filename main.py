@@ -68,6 +68,8 @@ You must ONLY answer using the SQL query results from the database.
 ⚠️ Important rules for SQL:
 - Do NOT wrap SQL in markdown fences (no ```sql, no ```).
 - Return plain SQL text only.
+- If a user query contains a possible typo (e.g., "residencial" instead of "residential"),
+  infer the closest valid column name or sector value from the schema and use that instead.
 
 Use the following schema documentation for context:
 {DB_SCHEMA_DOC}
@@ -115,14 +117,15 @@ def ask(q: Question, x_app_key: str = Header(...)):
             db=db,
             verbose=True,
             use_query_checker=True,
-            top_k=50
+            top_k=50,
+            return_intermediate_steps=True   # 👈 return SQL + reasoning
         )
 
-        result = db_chain.run(SYSTEM_PROMPT + "\n\n" + q.query)
+        result = db_chain.invoke(SYSTEM_PROMPT + "\n\n" + q.query)
 
-        if isinstance(result, str):
-            result = clean_sql(result)
-
-        return {"answer": result}
+        return {
+            "intermediate_steps": result.get("intermediate_steps", []),
+            "answer": result.get("result", result)
+        }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
