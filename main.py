@@ -25,13 +25,29 @@ if not OPENAI_API_KEY or not SUPABASE_DB_URL:
 llm = ChatOpenAI(model="gpt-4o", temperature=0, openai_api_key=OPENAI_API_KEY)
 
 # Supabase (Postgres) DB connection
-engine = create_engine(SUPABASE_DB_URL, pool_pre_ping=True)
+from langchain_community.utilities import SQLDatabase
 
 # Restrict DB access ONLY to documented tables/views
 allowed_tables = [
-    "v_monthly_cpi"
+    "energy_balance_long",
+    "entities",
+    "monthly_cpi_mv",
+    "price_with_usd",
+    "tariff_with_usd",
+    "tech_quantity_view",
+    "trade",
+    "trade_derived_entities",
+    "trade_by_type",
+    "trade_by_source",
+    "trade_by_ownership"
 ]
-db = SQLDatabase(engine, include_tables=allowed_tables)
+
+db = SQLDatabase.from_uri(
+    SUPABASE_DB_URL,
+    schema="public",
+    include_tables=allowed_tables,
+    view_support=True  # 👈 allow access to views and materialized views
+)
 
 # SQL Chain
 db_chain = SQLDatabaseChain.from_llm(
