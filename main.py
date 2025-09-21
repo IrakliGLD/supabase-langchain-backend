@@ -104,7 +104,13 @@ def ask(q: Question, x_app_key: str = Header(...)):
 
     try:
         # Always use server's own OpenAI key
-        llm = ChatOpenAI(model="gpt-4o", temperature=0, openai_api_key=OPENAI_API_KEY)
+        llm = ChatOpenAI(
+            model="gpt-4o",
+            temperature=0,
+            openai_api_key=OPENAI_API_KEY,
+            service_tier="flex"
+        )
+
         db_chain = SQLDatabaseChain.from_llm(
             llm=llm,
             db=db,
