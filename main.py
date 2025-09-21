@@ -29,7 +29,7 @@ engine = create_engine(SUPABASE_DB_URL, pool_pre_ping=True)
 
 # Restrict DB access ONLY to documented tables/views
 allowed_tables = [
-    "monthly_cpi"
+    "v_monthly_cpi"
 ]
 db = SQLDatabase(engine, include_tables=allowed_tables)
 
