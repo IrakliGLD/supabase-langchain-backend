@@ -107,8 +107,7 @@ def ask(q: Question, x_app_key: str = Header(...)):
         llm = ChatOpenAI(
             model="gpt-4o-mini",
             temperature=0,
-            openai_api_key=OPENAI_API_KEY,
-            service_tier="flex"
+            openai_api_key=OPENAI_API_KEY
         )
 
         db_chain = SQLDatabaseChain.from_llm(
