@@ -37,6 +37,18 @@ allowed_tables = [
 ]
 db = SQLDatabase(engine, include_tables=allowed_tables)
 
+# --- Patch execution to clean accidental markdown fences ---
+def clean_sql(query: str) -> str:
+    """Remove markdown fences if GPT accidentally adds them."""
+    return query.replace("```sql", "").replace("```", "").strip()
+
+old_execute = db._execute
+def cleaned_execute(sql: str, *args, **kwargs):
+    sql = clean_sql(sql)
+    return old_execute(sql, *args, **kwargs)
+db._execute = cleaned_execute
+# ----------------------------------------------------------
+
 # FastAPI app
 app = FastAPI(title="Supabase LangChain Backend")
 
@@ -53,10 +65,11 @@ app.add_middleware(
 SYSTEM_PROMPT = f"""You are a data assistant.
 You must ONLY answer using the SQL query results from the database.
 
-⚠️ Important rules:
-- NEVER wrap queries in markdown fences (no ```sql or ```).
-- Return only clean SQL when generating queries.
-- Use the following schema documentation for context:
+⚠️ Important rules for SQL:
+- Do NOT wrap SQL in markdown fences (no ```sql, no ```).
+- Return plain SQL text only.
+
+Use the following schema documentation for context:
 {DB_SCHEMA_DOC}
 
 If results are empty or insufficient, reply exactly: "I don’t know based on the data."
@@ -65,10 +78,6 @@ Never use outside knowledge.
 
 class Question(BaseModel):
     query: str
-
-def clean_sql(query: str) -> str:
-    """Remove markdown fences if GPT accidentally adds them."""
-    return query.replace("```sql", "").replace("```", "").strip()
 
 @app.get("/healthz")
 def health():
