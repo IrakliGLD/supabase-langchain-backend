@@ -5,3 +5,4 @@ python-dotenv
 pydantic
 llama-index-core
 llama-index-llms-openai
+psycopg2-binary
