@@ -462,7 +462,7 @@ def ask(q: Question, x_app_key: str = Header(...)):
 
     try:
         llm = ChatOpenAI(
-            model="gpt-5",
+            model="gpt-5-mini",
             temperature=0,
             openai_api_key=OPENAI_API_KEY
         )
