@@ -15,6 +15,7 @@ from llama_index.llms.openai import OpenAI as LI_OpenAI
 from llama_index.core.indices.struct_store.sql_query import NLSQLTableQueryEngine
 from llama_index.core import SQLDatabase as LI_SQLDatabase
 
+
 # Import DB documentation context (no circular import)
 from context import DB_SCHEMA_DOC
 
