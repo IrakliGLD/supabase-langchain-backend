@@ -105,6 +105,19 @@ ANSWERING RULES
    - If user mentions "line" → return time series data with date + value.
    - If unclear but "chart/plot/graph" mentioned → default to bar chart data.
 
+Chart-specific rule:
+- If the user asks for a chart, plot, or graph, you must return the raw SQL rows
+  converted into JSON objects with explicit keys, not just lists.
+- For time series (date + value):
+  Example: [{"date": "2021-04-01", "value": 753.3}, {"date": "2021-05-01", "value": 1211.7}]
+- For categorical (sector + value):
+  Example: [{"sector": "Residential", "volume_tj": 131937.2}, {"sector": "Road", "volume_tj": 109821.3}]
+- For sector + source breakdowns:
+  Example: [{"sector": "Residential", "energy_source": "Electricity", "volume_tj": 5000.0}]
+- Never add explanations, text, or narration when chart output is requested.
+- Always ensure keys are consistent and lowercase (date, sector, energy_source, value, volume_tj).
+
+
 FORMATTING RULES
 - For text answers: short bullet points or compact lists.
 - For chart answers: strict JSON array, nothing else.
