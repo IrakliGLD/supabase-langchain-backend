@@ -40,6 +40,7 @@ db = SQLDatabase(engine, include_tables=allowed_tables)
 
 # --- Patch execution to clean accidental markdown fences ---
 def clean_sql(query: str) -> str:
+    """Remove markdown fences if GPT accidentally adds them."""
     return query.replace("```sql", "").replace("```", "").strip()
 
 old_execute = db._execute
@@ -49,22 +50,10 @@ def cleaned_execute(sql: str, *args, **kwargs):
 db._execute = cleaned_execute
 # ----------------------------------------------------------
 
-# Normalize SQL result tuples -> dicts
-def normalize_result(result, keys=None):
-    if not result:
-        return []
-    normalized = []
-    for row in result:
-        if isinstance(row, tuple) and keys:
-            normalized.append({k: (float(v) if isinstance(v, Decimal) else v) for k, v in zip(keys, row)})
-        elif isinstance(row, dict):
-            normalized.append({k: (float(v) if isinstance(v, Decimal) else v) for k, v in row.items()})
-    return normalized
-
 # FastAPI app
 app = FastAPI(title="Supabase LangChain Backend")
 
-# CORS
+# CORS settings (open for now)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[ALLOWED_ORIGINS] if ALLOWED_ORIGINS != "*" else ["*"],
@@ -73,6 +62,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Updated system prompt
 SYSTEM_PROMPT = f"""You are a data assistant.
 You must ONLY answer using the SQL query results from the database.
 
@@ -81,12 +71,6 @@ You must ONLY answer using the SQL query results from the database.
 - Return plain SQL text only.
 - If a user query contains a possible typo (e.g., "residencial" instead of "residential"),
   infer the closest valid column name or sector value from the schema and use that instead.
-
-📊 Chart instructions:
-- If the user asks for a "pie chart", return tabular data + set chartType="pie".
-- If the user asks for a "bar chart" or "histogram", return tabular data + set chartType="bar".
-- If the user asks for a "line chart", return tabular data + set chartType="line".
-- If no chart is requested, chartType=null.
 
 Use the following schema documentation for context:
 {DB_SCHEMA_DOC}
@@ -117,10 +101,12 @@ def introspect():
 
 @app.post("/ask")
 def ask(q: Question, x_app_key: str = Header(...)):
+    # 🔒 API Key Authentication
     if not APP_SECRET_KEY or x_app_key != APP_SECRET_KEY:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     try:
+        # Always use server's own OpenAI key
         llm = ChatOpenAI(
             model="gpt-4o-mini",
             temperature=0,
@@ -133,42 +119,40 @@ def ask(q: Question, x_app_key: str = Header(...)):
             verbose=True,
             use_query_checker=True,
             top_k=50,
-            return_direct=True
+            return_intermediate_steps=True
         )
 
-        raw_result = db_chain.run(SYSTEM_PROMPT + "\n\n" + q.query)
+        result = db_chain.invoke(SYSTEM_PROMPT + "\n\n" + q.query)
+        raw_answer = result.get("result", result)
 
-        response = {
-            "answer": None,
-            "chartData": None,
-            "chartType": None
+        # ---------------- Normalize response ----------------
+        chart_type = None
+        chart_data = []
+
+        if "chart" in q.query.lower():
+            chart_type = "pie" if "pie" in q.query.lower() else "bar"
+
+            if isinstance(raw_answer, list):
+                for row in raw_answer:
+                    # Convert decimals & tuples into dicts
+                    row = [float(x) if isinstance(x, Decimal) else x for x in row]
+
+                    # Case 1: ('Residential', 131937.2)
+                    if len(row) == 2:
+                        label, value = row
+                        chart_data.append({"label": str(label), "value": float(value)})
+
+                    # Case 2: (2022, 'Residential', 131937.2)
+                    elif len(row) >= 3:
+                        _, sector, value = row[:3]
+                        chart_data.append({"sector": str(sector), "volume_tj": float(value)})
+        # -----------------------------------------------------
+
+        return {
+            "answer": str(raw_answer),
+            "chartType": chart_type,
+            "data": chart_data
         }
-
-        # Detect chart type from query
-        query_lower = q.query.lower()
-        if "pie chart" in query_lower:
-            response["chartType"] = "pie"
-        elif "bar chart" in query_lower or "histogram" in query_lower:
-            response["chartType"] = "bar"
-        elif "line chart" in query_lower:
-            response["chartType"] = "line"
-
-        if isinstance(raw_result, list):
-            if raw_result and isinstance(raw_result[0], tuple):
-                keys = ["year", "sector", "value"] if len(raw_result[0]) == 3 else None
-                normalized = normalize_result(raw_result, keys)
-                response["answer"] = "Here’s the chart:"
-                response["chartData"] = normalized
-            elif raw_result and isinstance(raw_result[0], dict):
-                normalized = normalize_result(raw_result)
-                response["answer"] = "Here’s the chart:"
-                response["chartData"] = normalized
-            else:
-                response["answer"] = str(raw_result)
-        else:
-            response["answer"] = str(raw_result)
-
-        return response
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
