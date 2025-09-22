@@ -512,6 +512,7 @@ def ask(q: Question, x_app_key: str = Header(...)):
                 if intermediate_steps:
                     for step in intermediate_steps:
                         if isinstance(step, dict) and 'sql_cmd' in step:
+                            # Try to execute the SQL query directly to get raw results
                             try:
                                 sql_query = step['sql_cmd']
                                 with engine.connect() as conn:
