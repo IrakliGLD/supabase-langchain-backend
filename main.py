@@ -65,60 +65,69 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Updated system prompt
+# Improved system prompt
 SYSTEM_PROMPT = f"""
-You are EnerBot, a strict data assistant.
+You are EnerBot, an expert Georgian electricity market data analyst with strict data integrity principles.
 
-GENERAL PRINCIPLES
-- Your ONLY source of truth is the SQL query results from the database.
-- Never use outside knowledge.
-- Never guess or fabricate values.
-- Always stay faithful to the schema and query results.
-- Be concise and precise in answers.
+=== CORE PRINCIPLES ===
+🔒 DATA INTEGRITY: Your ONLY source of truth is the SQL query results from the database. Never use outside knowledge, assumptions, or estimates.
+📊 ACCURACY FIRST: Be precise with numbers, dates, and categories. Round decimals appropriately but maintain data fidelity.
+🎯 RELEVANT RESULTS: Focus on what the user actually asked for. Don't provide tangential information.
+🚫 NO HALLUCINATION: If unsure about anything, respond: "I don't know based on the available data."
 
-SQL RULES
-- Do NOT wrap SQL in markdown fences (no ```sql, no ```).
-- Always return plain SQL text only.
-- Use only the documented tables and columns.
-- Be tolerant of user typos or slight variations (e.g., "residencial" → "residential").
-- Always double-check column and table names against the schema.
-- Never join tables unless clearly required by schema logic.
-- When aggregating, always use correct SQL aggregation functions (SUM, AVG, COUNT, etc.).
-- If unsure, return: "I don't know based on the data."
+=== SQL QUERY RULES ===
+✅ CLEAN SQL ONLY: Return plain SQL text without markdown fences (no ```sql, no ```).
+✅ SCHEMA COMPLIANCE: Use only documented tables/columns. Double-check all names against the schema.
+✅ FLEXIBLE MATCHING: Handle user typos gracefully (e.g., "residencial" → "residential", "elektric" → "electricity").
+✅ PROPER AGGREGATION: Use correct SQL functions (SUM for totals, AVG for averages, COUNT for quantities).
+✅ SMART FILTERING: Apply appropriate WHERE clauses for date ranges, sectors, and energy sources.
+✅ LOGICAL JOINS: Only join tables when schema relationships clearly support it.
+✅ PERFORMANCE AWARE: Use LIMIT clauses for large datasets, especially for charts.
 
-ANSWERING RULES
-1. If no results:
-   - Respond exactly: "I don't know based on the data."
+=== RESPONSE FORMATTING ===
 
-2. If results exist AND the user did NOT ask for a chart:
-   - Provide a clear, structured summary (bullets, simple text, or tabular style).
-   - Mention both dimension (e.g., sector, source, year) and measure (e.g., volume, price).
-   - Convert raw decimals into readable numbers with reasonable rounding.
+📝 FOR TEXT ANSWERS (when user does NOT request charts):
+- Provide clear, structured summaries
+- Use bullet points or tables for multiple data points
+- Include context: time periods, sectors, units of measurement
+- Round numbers appropriately (e.g., "1,083.9 TJ" not "1083.87439 TJ")
+- Highlight key insights or trends when relevant
 
-3. If results exist AND the user DID ask for a chart (mentions chart, plot, graph, bar, pie, line, etc.):
-   - Return ONLY structured JSON objects in the response `data`.
-   - Do not include narration, explanations, or units inside the JSON.
-   - Example (time series):
-       [{{"date": "2021-04-01", "value": 753.3}}, {{"date": "2021-05-01", "value": 1211.7}}]
+📈 FOR CHART REQUESTS (when user mentions: chart, plot, graph, visualize, show as):
+- Let the backend handle data formatting - just return natural language summary
+- Mention what time period, sectors, or categories are included
+- Note any significant patterns or outliers
+- Keep explanations brief since the chart will show the details
 
-CHART FORMATTING RULES
-- For time series (date + value):
-  Example: [{{"date": "2021-04-01", "value": 753.3}}, {{"date": "2021-05-01", "value": 1211.7}}]
-- For categorical (sector + value):
-  Example: [{{"sector": "Residential", "volume_tj": 131937.2}}, {{"sector": "Road", "volume_tj": 109821.3}}]
-- For sector + source breakdowns:
-  Example: [{{"sector": "Residential", "energy_source": "Electricity", "volume_tj": 5000.0}}]
-- Keys must always be lowercase: date, sector, energy_source, value, volume_tj.
-- Never add explanations, text, or narration when chart output is requested.
+=== QUERY OPTIMIZATION ===
+🔍 TIME SERIES: For monthly/yearly trends, ensure proper date ordering (ORDER BY date/period)
+🔍 CATEGORIZATION: Group by relevant dimensions (sector, energy_source, entity)
+🔍 AGGREGATION: Sum volumes, average prices, count occurrences as appropriate
+🔍 FILTERING: Apply reasonable date ranges if not specified (e.g., last 12 months)
 
-FORMATTING RULES
-- For text answers: short bullet points or compact lists.
-- For chart answers: strict JSON array in `data`, nothing else.
-- For dates: keep ISO style (YYYY-MM-DD) unless user asks otherwise.
-- For decimals: return numeric values as floats.
+=== COMMON PATTERNS ===
+• Energy consumption by sector → GROUP BY sector, SUM(volume_tj)
+• Monthly trends → GROUP BY date/period, ORDER BY date
+• Price comparisons → SELECT entity, price, date for relevant periods
+• Market share → Calculate percentages using window functions
+• Import/export data → Use trade table with appropriate entity filters
 
-SCHEMA DOCUMENTATION
+=== ERROR HANDLING ===
+❌ No data found → "I don't have data for that specific request."
+❌ Ambiguous request → Ask for clarification: "Could you specify the time period/sector?"
+❌ Invalid parameters → Suggest alternatives based on available data
+
+=== SCHEMA DOCUMENTATION ===
 {DB_SCHEMA_DOC}
+
+=== EXAMPLES ===
+Good: "Residential sector consumed 131,937.2 TJ in 2022, representing 45% of total energy use."
+Bad: "Energy consumption is typically high in residential areas due to heating and cooling needs."
+
+Good: "Natural gas prices ranged from $2.15 to $4.78 per unit between Jan-Dec 2022."
+Bad: "Natural gas prices have been volatile recently due to global market conditions."
+
+REMEMBER: You are a data analyst, not a general energy expert. Stick to what the data shows!
 """
 
 class Question(BaseModel):
@@ -156,11 +165,53 @@ def is_chart_request(query: str) -> tuple[bool, str]:
         return True, "bar"  # default
 
 def process_sql_results_for_chart(raw_results, query: str):
-    """Process SQL results into chart-friendly format"""
+    """Process SQL results into chart-friendly format with metadata"""
     if not raw_results or not isinstance(raw_results, list):
-        return []
+        return [], {}
     
     chart_data = []
+    metadata = {
+        "title": "Energy Data",
+        "xAxisTitle": "Category",
+        "yAxisTitle": "Value",
+        "datasetLabel": "Data"
+    }
+    
+    # Analyze query to determine appropriate labels
+    query_lower = query.lower()
+    
+    # Determine Y-axis title based on common patterns
+    if any(word in query_lower for word in ["volume", "consumption", "energy"]):
+        if "tj" in query_lower or "terajoule" in query_lower:
+            metadata["yAxisTitle"] = "Volume (TJ)"
+        else:
+            metadata["yAxisTitle"] = "Energy Volume"
+    elif any(word in query_lower for word in ["price", "cost", "tariff"]):
+        metadata["yAxisTitle"] = "Price"
+    elif any(word in query_lower for word in ["count", "number", "quantity"]):
+        metadata["yAxisTitle"] = "Count"
+    elif any(word in query_lower for word in ["percentage", "percent", "share"]):
+        metadata["yAxisTitle"] = "Percentage (%)"
+    
+    # Determine chart title based on query content
+    if "residential" in query_lower:
+        metadata["title"] = "Residential Energy Data"
+    elif "commercial" in query_lower:
+        metadata["title"] = "Commercial Energy Data"
+    elif "industrial" in query_lower:
+        metadata["title"] = "Industrial Energy Data"
+    elif "monthly" in query_lower or "month" in query_lower:
+        metadata["title"] = "Monthly Energy Trends"
+    elif "yearly" in query_lower or "year" in query_lower or "annual" in query_lower:
+        metadata["title"] = "Annual Energy Data"
+    elif "sector" in query_lower:
+        metadata["title"] = "Energy Data by Sector"
+    elif "source" in query_lower:
+        metadata["title"] = "Energy Data by Source"
+    elif "price" in query_lower:
+        metadata["title"] = "Energy Prices"
+    elif "trade" in query_lower or "import" in query_lower or "export" in query_lower:
+        metadata["title"] = "Energy Trade Data"
     
     for row in raw_results:
         # Convert any Decimal objects to float
@@ -190,9 +241,15 @@ def process_sql_results_for_chart(raw_results, query: str):
             
             if is_date:
                 chart_data.append({"date": str(col1), "value": float(col2)})
+                metadata["xAxisTitle"] = "Date"
+                metadata["datasetLabel"] = "Value over Time"
+                if not metadata.get("title_set"):
+                    metadata["title"] = "Time Series Analysis"
             else:
                 # Categorical data
                 chart_data.append({"sector": str(col1), "volume_tj": float(col2)})
+                metadata["xAxisTitle"] = "Sector" if "sector" in query_lower else "Category"
+                metadata["datasetLabel"] = "Energy Volume"
         
         # Case 2: Three columns - often (period/year, category, value)
         elif len(row) == 3:
@@ -201,9 +258,15 @@ def process_sql_results_for_chart(raw_results, query: str):
             # Check if first column looks like a date/period
             if isinstance(col1, str) and ('-' in col1 or '/' in col1):
                 chart_data.append({"date": str(col1), "sector": str(col2), "value": float(col3)})
+                metadata["xAxisTitle"] = "Date"
+                metadata["datasetLabel"] = str(col2)
+                if not metadata.get("title_set"):
+                    metadata["title"] = "Time Series by Category"
             else:
                 # Treat as (year, sector, value) or similar
                 chart_data.append({"sector": str(col2), "volume_tj": float(col3)})
+                metadata["xAxisTitle"] = "Sector"
+                metadata["datasetLabel"] = "Energy Volume"
         
         # Case 3: Four or more columns - assume (period, sector, source, value)
         elif len(row) >= 4:
@@ -214,8 +277,12 @@ def process_sql_results_for_chart(raw_results, query: str):
                 "energy_source": str(source),
                 "volume_tj": float(value)
             })
+            metadata["xAxisTitle"] = "Date"
+            metadata["datasetLabel"] = "Energy Sources"
+            if not metadata.get("title_set"):
+                metadata["title"] = "Energy Sources Over Time"
     
-    return chart_data
+    return chart_data, metadata
 
 def extract_json_from_text(text: str):
     """Extract JSON array from text response if present"""
@@ -293,8 +360,17 @@ def ask(q: Question, x_app_key: str = Header(...)):
         if is_chart:
             # First, try to extract JSON from the text answer
             json_data = extract_json_from_text(str(raw_answer))
+            chart_metadata = {}
+            
             if json_data:
                 chart_data = json_data
+                # Create basic metadata for JSON data
+                chart_metadata = {
+                    "title": "Energy Data Visualization",
+                    "xAxisTitle": "Category",
+                    "yAxisTitle": "Value",
+                    "datasetLabel": "Data"
+                }
                 final_answer = "Here's your data visualization:"
             else:
                 # If no JSON in answer, try to get raw SQL results
@@ -310,7 +386,7 @@ def ask(q: Question, x_app_key: str = Header(...)):
                                     print(f"Raw SQL results: {raw_results}")
                                     
                                     if raw_results:
-                                        chart_data = process_sql_results_for_chart(raw_results, q.query)
+                                        chart_data, chart_metadata = process_sql_results_for_chart(raw_results, q.query)
                                         final_answer = "Here's your data visualization:"
                                         break
                             except Exception as e:
@@ -321,7 +397,8 @@ def ask(q: Question, x_app_key: str = Header(...)):
         response = {
             "answer": final_answer if not chart_data else "Here's your data visualization:",
             "chartType": chart_type if chart_data else None,
-            "data": chart_data if chart_data else None
+            "data": chart_data if chart_data else None,
+            "chartMetadata": chart_metadata if chart_data else None
         }
         
         print(f"Final response: {response}")
