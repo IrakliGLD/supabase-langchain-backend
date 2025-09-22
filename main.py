@@ -83,8 +83,6 @@ You are EnerBot, an expert Georgian electricity market data analyst with advance
 ✅ SMART FILTERING: Apply appropriate WHERE clauses for date ranges, sectors, and energy sources.
 ✅ LOGICAL JOINS: Only join tables when schema relationships clearly support it.
 ✅ PERFORMANCE AWARE: Use LIMIT clauses for large datasets, especially for charts.
-✅ Tables that store dates (like `tech_quantity`) do not have a `year` column. Always use EXTRACT(YEAR FROM date) AS year when grouping or filtering by year.
-
 
 === DATA PRESENTATION INTELLIGENCE ===
 🧠 THINK ABOUT THE STORY: What is the user trying to understand?
@@ -204,6 +202,97 @@ def is_chart_request(query: str) -> tuple[bool, str]:
     # Let the model decide the best chart type based on context
     return True, "auto"  # Changed from specific type to "auto"
 
+def parse_text_for_chart_data(text: str, query: str):
+    """Parse text response for chart data when JSON extraction fails"""
+    if not text:
+        return None
+    
+    lines = text.strip().split('\n')
+    chart_data = []
+    
+    # Look for data patterns in text
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith('-') == False:
+            continue
+            
+        # Remove bullet points and clean up
+        line = line.replace('- **', '').replace('**', '').replace('*', '').strip()
+        
+        # Try to extract date and value patterns
+        # Pattern: "April 2021: 753.3 thousand MWh" or similar
+        import re
+        
+        # Match month/year patterns with values
+        month_pattern = r'(\w+\s+\d{4})[:\s]*([\d,\.]+)'
+        match = re.search(month_pattern, line)
+        if match:
+            date_str, value_str = match.groups()
+            try:
+                # Convert month name to date format
+                from datetime import datetime
+                date_obj = datetime.strptime(date_str, '%B %Y')
+                formatted_date = date_obj.strftime('%Y-%m')
+                
+                # Clean and convert value
+                value = float(value_str.replace(',', ''))
+                chart_data.append({"date": formatted_date, "value": value})
+            except:
+                continue
+        
+        # Match date patterns like "2022-04" with values
+        date_pattern = r'(\d{4}-\d{2})[:\s,]*([\d,\.]+)'
+        match = re.search(date_pattern, line)
+        if match:
+            date_str, value_str = match.groups()
+            try:
+                value = float(value_str.replace(',', ''))
+                chart_data.append({"date": date_str, "value": value})
+            except:
+                continue
+    
+    return chart_data if chart_data else None
+
+def create_metadata_from_query(query: str):
+    """Create chart metadata based on query analysis"""
+    query_lower = query.lower()
+    
+    metadata = {
+        "title": "Energy Data",
+        "xAxisTitle": "Category",
+        "yAxisTitle": "Value",
+        "datasetLabel": "Data"
+    }
+    
+    # Determine Y-axis title based on common patterns
+    if any(word in query_lower for word in ["generation", "generated", "produce", "output"]):
+        if "mwh" in query_lower or "megawatt" in query_lower:
+            metadata["yAxisTitle"] = "Generation (MWh)"
+        elif "tj" in query_lower or "terajoule" in query_lower:
+            metadata["yAxisTitle"] = "Generation (TJ)"
+        else:
+            metadata["yAxisTitle"] = "Energy Generation"
+    elif any(word in query_lower for word in ["volume", "consumption", "energy"]):
+        metadata["yAxisTitle"] = "Volume (TJ)"
+    elif any(word in query_lower for word in ["price", "cost", "tariff"]):
+        metadata["yAxisTitle"] = "Price"
+    
+    # Determine chart title
+    if "hydro" in query_lower:
+        if "generation" in query_lower:
+            metadata["title"] = "Hydro Power Generation"
+        else:
+            metadata["title"] = "Hydro Energy Data"
+    elif "monthly" in query_lower or "month" in query_lower:
+        metadata["title"] = "Monthly Energy Trends"
+    elif "generation" in query_lower:
+        metadata["title"] = "Energy Generation"
+    
+    # X-axis title
+    if any(word in query_lower for word in ["from", "to", "april", "december", "monthly", "yearly"]):
+        metadata["xAxisTitle"] = "Date"
+        metadata["datasetLabel"] = "Monthly Values"
+    
 def intelligent_chart_type_selection(raw_results, query: str, explicit_type: str = None):
     """Intelligently select the best chart type based on data characteristics and query context"""
     
@@ -495,6 +584,8 @@ def ask(q: Question, x_app_key: str = Header(...)):
         final_answer = raw_answer
         
         if is_chart:
+            print(f"Processing chart request...")
+            
             # First, try to extract JSON from the text answer
             json_data = extract_json_from_text(str(raw_answer))
             chart_metadata = {}
@@ -508,35 +599,65 @@ def ask(q: Question, x_app_key: str = Header(...)):
                     "yAxisTitle": "Value",
                     "datasetLabel": "Data"
                 }
+                # Intelligently determine the best chart type
+                optimal_chart_type = intelligent_chart_type_selection(json_data, q.query, chart_type)
+                chart_type = optimal_chart_type
                 final_answer = "Here's your data visualization:"
             else:
                 # If no JSON in answer, try to get raw SQL results
                 if intermediate_steps:
                     for step in intermediate_steps:
-                        if isinstance(step, dict) and 'sql_cmd' in step:
-                            # Try to execute the SQL query directly to get raw results
-                            try:
+                        if isinstance(step, dict):
+                            # Look for SQL command in various possible keys
+                            sql_query = None
+                            if 'sql_cmd' in step:
                                 sql_query = step['sql_cmd']
-                                with engine.connect() as conn:
-                                    result_proxy = conn.execute(text(sql_query))
-                                    raw_results = result_proxy.fetchall()
-                                    print(f"Raw SQL results: {raw_results}")
-                                    
-                                    if raw_results:
-                                        chart_data, chart_metadata = process_sql_results_for_chart(raw_results, q.query)
+                            elif 'query' in step:
+                                sql_query = step['query']
+                            elif 'sql' in step:
+                                sql_query = step['sql']
+                            
+                            if sql_query:
+                                try:
+                                    print(f"Executing SQL: {sql_query}")
+                                    with engine.connect() as conn:
+                                        result_proxy = conn.execute(text(sql_query))
+                                        raw_results = result_proxy.fetchall()
+                                        print(f"Raw SQL results: {raw_results}")
                                         
-                                        # Intelligently determine the best chart type
-                                        optimal_chart_type = intelligent_chart_type_selection(raw_results, q.query, chart_type)
-                                        chart_type = optimal_chart_type
-                                        
-                                        print(f"Selected chart type: {chart_type}")
-                                        final_answer = "Here's your data visualization:"
-                                        break
-                            except Exception as e:
-                                print(f"Error executing SQL directly: {e}")
-                                continue
+                                        if raw_results:
+                                            chart_data, chart_metadata = process_sql_results_for_chart(raw_results, q.query)
+                                            
+                                            # Intelligently determine the best chart type
+                                            optimal_chart_type = intelligent_chart_type_selection(raw_results, q.query, chart_type)
+                                            chart_type = optimal_chart_type
+                                            
+                                            print(f"Selected chart type: {chart_type}")
+                                            print(f"Chart data: {chart_data[:2]}..." if len(chart_data) > 2 else f"Chart data: {chart_data}")
+                                            final_answer = "Here's your data visualization:"
+                                            break
+                                except Exception as e:
+                                    print(f"Error executing SQL directly: {e}")
+                                    continue
+                
+                # If still no chart data, try to parse the answer text for tabular data
+                if not chart_data:
+                    print("Attempting to parse text answer for chart data...")
+                    chart_data = parse_text_for_chart_data(str(raw_answer), q.query)
+                    if chart_data:
+                        chart_metadata = create_metadata_from_query(q.query)
+                        optimal_chart_type = intelligent_chart_type_selection(chart_data, q.query, chart_type)
+                        chart_type = optimal_chart_type
+                        final_answer = "Here's your data visualization:"
         
         # Clean up the response
+        print(f"Final processing - Chart data length: {len(chart_data) if chart_data else 0}")
+        
+        # If this was supposed to be a chart but we have no chart data, 
+        # return an error message instead of empty response
+        if is_chart and not chart_data:
+            final_answer = "I was unable to generate chart data from the query results. The data might not be in a format suitable for visualization, or there might be no data available for the specified criteria."
+        
         response = {
             "answer": final_answer if not chart_data else "Here's your data visualization:",
             "chartType": chart_type if chart_data else None,
