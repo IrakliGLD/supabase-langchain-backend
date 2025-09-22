@@ -93,23 +93,25 @@ ANSWERING RULES
    - Convert raw decimals into readable numbers with reasonable rounding.
 
 3. If results exist AND the user DID ask for a chart (mentions chart, plot, graph, bar, pie, line, etc.):
-   - Return ONLY the raw SQL rows as a JSON array of objects with explicit keys.
-   - Do not include narration, explanations, or units.
-   - Examples:
-       - Time series: [{{"date": "2021-04-01", "value": 753.3}}, {{"date": "2021-05-01", "value": 1211.7}}]
-       - Categorical: [{{"sector": "Residential", "volume_tj": 131937.2}}, {{"sector": "Road", "volume_tj": 109821.3}}]
-       - Sector+source: [{{"sector": "Residential", "energy_source": "Electricity", "volume_tj": 5000.0}}]
+   - Return ONLY structured JSON objects in the response `data`.
+   - Do not include narration, explanations, or units inside the JSON.
+   - Example (time series):
+       [{{"date": "2021-04-01", "value": 753.3}}, {{"date": "2021-05-01", "value": 1211.7}}]
 
-4. Chart type selection:
-   - "pie" → sector/value style
-   - "bar" → grouped or time series data
-   - "line" → time series with date + value
-   - if user only says "chart/plot/graph" → default to "bar"
+CHART FORMATTING RULES
+- For time series (date + value):
+  Example: [{{"date": "2021-04-01", "value": 753.3}}, {{"date": "2021-05-01", "value": 1211.7}}]
+- For categorical (sector + value):
+  Example: [{{"sector": "Residential", "volume_tj": 131937.2}}, {{"sector": "Road", "volume_tj": 109821.3}}]
+- For sector + source breakdowns:
+  Example: [{{"sector": "Residential", "energy_source": "Electricity", "volume_tj": 5000.0}}]
+- Keys must always be lowercase: date, sector, energy_source, value, volume_tj.
+- Never add explanations, text, or narration when chart output is requested.
 
 FORMATTING RULES
 - For text answers: short bullet points or compact lists.
-- For chart answers: strict JSON array, nothing else.
-- For dates: keep ISO style (YYYY-MM-DD).
+- For chart answers: strict JSON array in `data`, nothing else.
+- For dates: keep ISO style (YYYY-MM-DD) unless user asks otherwise.
 - For decimals: return numeric values as floats.
 
 SCHEMA DOCUMENTATION
@@ -173,20 +175,28 @@ def ask(q: Question, x_app_key: str = Header(...)):
             else:
                 chart_type = "bar"
 
-            # Ensure JSON-style output
             if isinstance(raw_answer, list):
                 for row in raw_answer:
                     row = [float(x) if isinstance(x, Decimal) else x for x in row]
 
-                    if chart_type in ["bar", "line"] and len(row) >= 2:
-                        if isinstance(row[0], (str, int)):
-                            chart_data.append({"date": str(row[0]), "value": float(row[1])})
-                    elif chart_type == "pie" and len(row) >= 2:
-                        chart_data.append({"sector": str(row[0]), "volume_tj": float(row[1])})
+                    # (date, value)
+                    if len(row) == 2 and isinstance(row[0], (str,)):
+                        chart_data.append({"date": str(row[0]), "value": float(row[1])})
+
+                    # (sector, value)
+                    elif len(row) == 2:
+                        label, value = row
+                        chart_data.append({"sector": str(label), "volume_tj": float(value)})
+
+                    # (year, sector, value)
+                    elif len(row) >= 3:
+                        _, sector, value = row[:3]
+                        chart_data.append({"sector": str(sector), "volume_tj": float(value)})
+
         # -----------------------------------------------------
 
         return {
-            "answer": str(raw_answer) if not chart_data else "Here’s the chart:",
+            "answer": None if chart_data else str(raw_answer),
             "chartType": chart_type,
             "data": chart_data
         }
