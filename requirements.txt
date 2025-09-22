@@ -6,4 +6,5 @@ langchain-experimental
 sqlalchemy
 psycopg2-binary
 python-dotenv
-llama-index>=0.11.0
+pydantic
+llama-index
