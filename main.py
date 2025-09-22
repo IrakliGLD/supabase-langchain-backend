@@ -43,7 +43,6 @@ db = SQLDatabase(engine, include_tables=allowed_tables)
 
 # --- Patch execution to clean accidental markdown fences ---
 def clean_sql(query: str) -> str:
-    """Remove markdown fences if GPT accidentally adds them."""
     return query.replace("```sql", "").replace("```", "").strip()
 
 old_execute = db._execute
@@ -74,10 +73,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Enhanced system prompt (unchanged)
+# Prompt
 SYSTEM_PROMPT = f"""
-You are EnerBot, an expert Georgian electricity market data analyst with advanced data visualization intelligence.
-...
+You are EnerBot, an expert Georgian electricity market data analyst...
 {DB_SCHEMA_DOC}
 """
 
@@ -95,9 +93,94 @@ def convert_decimal_to_float(obj):
         return {k: convert_decimal_to_float(v) for k, v in obj.items()}
     return obj
 
-# === chart detection and processing helpers remain unchanged ===
-# (is_chart_request, intelligent_chart_type_selection, process_sql_results_for_chart, extract_json_from_text)
-# ---------------------------------------------------------------
+# === Chart helpers ===
+def is_chart_request(query: str) -> tuple[bool, str]:
+    query_lower = query.lower()
+    chart_keywords = ["chart","plot","graph","visualize","visualization","show as","display as","present as","draw","render as"]
+    chart_patterns = ["bar chart","line chart","pie chart","show as bar","show as line","show as pie","display as chart","visualize as","plot as"]
+
+    for pattern in chart_patterns:
+        if pattern in query_lower:
+            if "pie" in pattern: return True, "pie"
+            if "line" in pattern: return True, "line"
+            return True, "bar"
+
+    is_chart = any(k in query_lower for k in chart_keywords)
+    if not is_chart:
+        return False, None
+    return True, "auto"
+
+def intelligent_chart_type_selection(raw_results, query: str, explicit_type: str = None):
+    if explicit_type and explicit_type != "auto":
+        return explicit_type
+    if not raw_results or not isinstance(raw_results, list):
+        return "bar"
+
+    query_lower = query.lower()
+    sample_row = raw_results[0]
+    num_rows = len(raw_results)
+    num_cols = len(sample_row) if isinstance(sample_row,(list,tuple)) else 0
+
+    if any(w in query_lower for w in ["trend","over time","monthly","yearly","progression"]):
+        return "line"
+    if any(w in query_lower for w in ["share","proportion","percentage","distribution","composition","breakdown"]):
+        return "pie"
+    if any(w in query_lower for w in ["compare","vs","versus","between"]):
+        return "bar"
+
+    if num_cols >= 2:
+        first_col = sample_row[0]
+        if isinstance(first_col,str):
+            for fmt in ['%Y-%m-%d','%Y-%m','%m/%d/%Y','%d/%m/%Y','%Y']:
+                try:
+                    datetime.strptime(first_col,fmt)
+                    return "line"
+                except: continue
+
+    if num_rows <= 6: return "pie"
+    if num_rows > 15: return "bar"
+    return "bar"
+
+def process_sql_results_for_chart(raw_results, query: str):
+    if not raw_results: return [], {}
+    chart_data, metadata = [], {"title":"Energy Data","xAxisTitle":"Category","yAxisTitle":"Value","datasetLabel":"Data"}
+    query_lower = query.lower()
+
+    for row in raw_results:
+        row = convert_decimal_to_float(row)
+        if not isinstance(row,(list,tuple)) or len(row)<2: continue
+
+        if len(row)==2:
+            col1,col2=row
+            is_date=False
+            if isinstance(col1,str):
+                for fmt in ['%Y-%m-%d','%Y-%m','%m/%d/%Y','%d/%m/%Y']:
+                    try:
+                        datetime.strptime(col1,fmt)
+                        is_date=True;break
+                    except: continue
+            if is_date:
+                chart_data.append({"date":str(col1),"value":float(col2)})
+                metadata["xAxisTitle"]="Date"
+                metadata["datasetLabel"]="Value over Time"
+            else:
+                chart_data.append({"category":str(col1),"value":float(col2)})
+        elif len(row)>=3:
+            chart_data.append({"date":str(row[0]),"category":str(row[1]),"value":float(row[2])})
+            metadata["xAxisTitle"]="Date"
+            metadata["datasetLabel"]="By Category"
+    return chart_data, metadata
+
+def extract_json_from_text(text: str):
+    if not text: return None
+    matches = re.findall(r'\[[\s\S]*?\]', text)
+    for m in matches:
+        try:
+            parsed = json.loads(m)
+            if isinstance(parsed,list) and parsed: return convert_decimal_to_float(parsed)
+        except: continue
+    return None
+# === End helpers ===
 
 @app.get("/healthz")
 def health():
@@ -108,92 +191,37 @@ def health():
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/introspect")
-def introspect():
-    try:
-        schema = db.get_table_info()
-        return {"schema": schema}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
 @app.post("/ask")
 def ask(q: Question, x_app_key: str = Header(...)):
     if not APP_SECRET_KEY or x_app_key != APP_SECRET_KEY:
         raise HTTPException(status_code=401, detail="Unauthorized")
-
     try:
-        # ✅ Use patched GPT-5-mini
-        llm = PatchedChatOpenAI(
-            model="gpt-5-mini",
-            temperature=0,
-            openai_api_key=OPENAI_API_KEY
-        )
+        llm = PatchedChatOpenAI(model="gpt-5-mini", temperature=0, openai_api_key=OPENAI_API_KEY)
+        db_chain = SQLDatabaseChain.from_llm(llm=llm, db=db, verbose=True, use_query_checker=True, top_k=50, return_intermediate_steps=True)
 
-        db_chain = SQLDatabaseChain.from_llm(
-            llm=llm,
-            db=db,
-            verbose=True,
-            use_query_checker=True,
-            top_k=50,
-            return_intermediate_steps=True
-        )
-
-        # Detect chart requests
         is_chart, chart_type = is_chart_request(q.query)
-        print(f"Chart detection: is_chart={is_chart}, chart_type={chart_type}, query='{q.query}'")
-
         result = db_chain.invoke(SYSTEM_PROMPT + "\n\n" + q.query)
-
-        raw_answer = result.get("result", "")
-        intermediate_steps = result.get("intermediate_steps", [])
-
-        print(f"Raw answer: {raw_answer}")
-        print(f"Intermediate steps: {intermediate_steps}")
-
-        chart_data = []
-        chart_metadata = {}
-        final_answer = raw_answer
+        raw_answer = result.get("result","")
+        steps = result.get("intermediate_steps",[])
+        chart_data, chart_metadata, final_answer = [], {}, raw_answer
 
         if is_chart:
-            json_data = extract_json_from_text(str(raw_answer))
+            json_data = extract_json_from_text(raw_answer)
             if json_data:
-                chart_data = json_data
-                chart_metadata = {
-                    "title": "Energy Data Visualization",
-                    "xAxisTitle": "Category",
-                    "yAxisTitle": "Value",
-                    "datasetLabel": "Data"
-                }
-                final_answer = "Here's your data visualization:"
+                chart_data=json_data;final_answer="Here's your data visualization:";chart_metadata={"title":"Energy Data","xAxisTitle":"Category","yAxisTitle":"Value","datasetLabel":"Data"}
             else:
-                for step in intermediate_steps:
-                    if isinstance(step, dict) and 'sql_cmd' in step:
+                for step in steps:
+                    if isinstance(step,dict) and "sql_cmd" in step:
                         try:
-                            sql_query = step['sql_cmd']
                             with engine.connect() as conn:
-                                result_proxy = conn.execute(text(sql_query))
-                                raw_results = result_proxy.fetchall()
-                                print(f"Raw SQL results: {raw_results}")
+                                rows = conn.execute(text(step["sql_cmd"])).fetchall()
+                                if rows:
+                                    chart_data, chart_metadata = process_sql_results_for_chart(rows,q.query)
+                                    chart_type = intelligent_chart_type_selection(rows,q.query,chart_type)
+                                    final_answer="Here's your data visualization:";break
+                        except Exception as e: continue
 
-                                if raw_results:
-                                    chart_data, chart_metadata = process_sql_results_for_chart(raw_results, q.query)
-                                    chart_type = intelligent_chart_type_selection(raw_results, q.query, chart_type)
-                                    final_answer = "Here's your data visualization:"
-                                    break
-                        except Exception as e:
-                            print(f"Error executing SQL directly: {e}")
-                            continue
-
-        response = {
-            "answer": final_answer if not chart_data else "Here's your data visualization:",
-            "chartType": chart_type if chart_data else None,
-            "data": chart_data if chart_data else None,
-            "chartMetadata": chart_metadata if chart_data else None
-        }
-
-        print(f"Final response: {response}")
-        return response
+        return {"answer": final_answer if not chart_data else "Here's your data visualization:","chartType": chart_type if chart_data else None,"data": chart_data if chart_data else None,"chartMetadata": chart_metadata if chart_data else None}
 
     except Exception as e:
-        print(f"Error in ask endpoint: {e}")
         raise HTTPException(status_code=500, detail=str(e))
