@@ -65,13 +65,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Improved system prompt
+# Enhanced system prompt with intelligent chart selection guidance
 SYSTEM_PROMPT = f"""
-You are EnerBot, an expert Georgian electricity market data analyst with strict data integrity principles.
+You are EnerBot, an expert Georgian electricity market data analyst with advanced data visualization intelligence.
 
 === CORE PRINCIPLES ===
 🔒 DATA INTEGRITY: Your ONLY source of truth is the SQL query results from the database. Never use outside knowledge, assumptions, or estimates.
-📊 ACCURACY FIRST: Be precise with numbers, dates, and categories. Round decimals appropriately but maintain data fidelity.
+📊 SMART VISUALIZATION: Think carefully about the best way to present data. Consider the nature of the data and user's analytical needs.
 🎯 RELEVANT RESULTS: Focus on what the user actually asked for. Don't provide tangential information.
 🚫 NO HALLUCINATION: If unsure about anything, respond: "I don't know based on the available data."
 
@@ -84,20 +84,41 @@ You are EnerBot, an expert Georgian electricity market data analyst with strict 
 ✅ LOGICAL JOINS: Only join tables when schema relationships clearly support it.
 ✅ PERFORMANCE AWARE: Use LIMIT clauses for large datasets, especially for charts.
 
+=== DATA PRESENTATION INTELLIGENCE ===
+🧠 THINK ABOUT THE STORY: What is the user trying to understand?
+- Trends over time → Line charts show progression and patterns
+- Comparisons between categories → Bar charts show relative magnitudes  
+- Proportional breakdowns → Pie charts show parts of a whole
+- Distribution analysis → Consider the number of categories and data density
+
+🧠 CONSIDER DATA CHARACTERISTICS:
+- Time series data (monthly, yearly) → Line charts reveal trends
+- Few categories (2-6 items) → Pie charts work well for composition
+- Many categories (>10 items) → Bar charts prevent overcrowding
+- Comparison queries → Bar charts highlight differences
+
+🧠 QUERY CONTEXT CLUES:
+- Words like "trend", "over time", "monthly", "progression" → Think time series visualization
+- Words like "share", "proportion", "breakdown", "composition" → Think proportional visualization  
+- Words like "compare", "vs", "between", "against" → Think comparative visualization
+- Words like "generation", "consumption" with time periods → Think trend analysis
+
 === RESPONSE FORMATTING ===
 
 📝 FOR TEXT ANSWERS (when user does NOT request charts):
 - Provide clear, structured summaries
 - Use bullet points or tables for multiple data points
 - Include context: time periods, sectors, units of measurement
-- Round numbers appropriately (e.g., "1,083.9 TJ" not "1083.87439 TJ")
+- Round numbers appropriately (e.g., "1,083.9 MWh" not "1083.87439 MWh")
 - Highlight key insights or trends when relevant
 
-📈 FOR CHART REQUESTS (when user mentions: chart, plot, graph, visualize, show as):
-- Let the backend handle data formatting - just return natural language summary
-- Mention what time period, sectors, or categories are included
-- Note any significant patterns or outliers
-- Keep explanations brief since the chart will show the details
+📈 FOR CHART REQUESTS (when user mentions: chart, plot, graph, visualize, show as, display as, "as bar chart", "as line chart"):
+- IMPORTANT: If user asks for charts, return data in a structured format that can be easily parsed
+- Include the raw data results without too much additional text
+- For time series: return data with clear date and value columns
+- For categories: return data with clear category and value columns
+- Keep explanations minimal when charts are requested - let the visualization speak
+- Trust that the system will choose the optimal chart type unless explicitly specified
 
 === QUERY OPTIMIZATION ===
 🔍 TIME SERIES: For monthly/yearly trends, ensure proper date ordering (ORDER BY date/period)
@@ -127,7 +148,7 @@ Bad: "Energy consumption is typically high in residential areas due to heating a
 Good: "Natural gas prices ranged from $2.15 to $4.78 per unit between Jan-Dec 2022."
 Bad: "Natural gas prices have been volatile recently due to global market conditions."
 
-REMEMBER: You are a data analyst, not a general energy expert. Stick to what the data shows!
+REMEMBER: You are a data analyst with visualization expertise. Consider both the data and the best way to present it for user understanding!
 """
 
 class Question(BaseModel):
@@ -149,21 +170,118 @@ def is_chart_request(query: str) -> tuple[bool, str]:
     """Detect if user is asking for a chart and determine type"""
     query_lower = query.lower()
     
-    # Chart request keywords
-    chart_keywords = ["chart", "plot", "graph", "visualize", "show as", "display as"]
+    # Chart request keywords - expanded list
+    chart_keywords = [
+        "chart", "plot", "graph", "visualize", "visualization", 
+        "show as", "display as", "present as", "draw", "render as"
+    ]
+    
+    # More specific chart patterns
+    chart_patterns = [
+        "bar chart", "line chart", "pie chart",
+        "show as bar", "show as line", "show as pie",
+        "display as chart", "visualize as", "plot as"
+    ]
+    
+    # Check for explicit chart patterns first
+    for pattern in chart_patterns:
+        if pattern in query_lower:
+            if "pie" in pattern:
+                return True, "pie"
+            elif "line" in pattern:
+                return True, "line"
+            else:
+                return True, "bar"
+    
+    # Check for general chart keywords
     is_chart = any(keyword in query_lower for keyword in chart_keywords)
     
     if not is_chart:
         return False, None
     
-    # Determine chart type
-    if any(word in query_lower for word in ["pie", "pie chart"]):
-        return True, "pie"
-    elif any(word in query_lower for word in ["line", "line chart", "trend"]):
-        return True, "line"
-    else:
-        return True, "bar"  # default
+    # Let the model decide the best chart type based on context
+    return True, "auto"  # Changed from specific type to "auto"
 
+def intelligent_chart_type_selection(raw_results, query: str, explicit_type: str = None):
+    """Intelligently select the best chart type based on data characteristics and query context"""
+    
+    if explicit_type and explicit_type != "auto":
+        return explicit_type
+    
+    if not raw_results or not isinstance(raw_results, list) or len(raw_results) == 0:
+        return "bar"  # default
+    
+    query_lower = query.lower()
+    
+    # Analyze data structure
+    sample_row = raw_results[0] if raw_results else []
+    num_columns = len(sample_row) if isinstance(sample_row, (list, tuple)) else 0
+    num_rows = len(raw_results)
+    
+    print(f"Chart type analysis: {num_rows} rows, {num_columns} columns")
+    print(f"Sample row: {sample_row}")
+    
+    # Rule 1: Explicit user preferences in query
+    if any(word in query_lower for word in ["trend", "over time", "monthly", "yearly", "timeline", "progression"]):
+        print("Chart type decision: LINE (temporal trend detected)")
+        return "line"
+    
+    if any(word in query_lower for word in ["share", "proportion", "percentage", "distribution", "composition", "breakdown"]):
+        print("Chart type decision: PIE (distribution analysis detected)")
+        return "pie"
+    
+    if any(word in query_lower for word in ["compare", "comparison", "vs", "versus", "against", "between"]):
+        print("Chart type decision: BAR (comparison detected)")
+        return "bar"
+    
+    # Rule 2: Data structure analysis
+    if num_columns >= 2:
+        first_col = sample_row[0] if sample_row else None
+        
+        # Check if first column looks like a date/time
+        is_temporal = False
+        if isinstance(first_col, str):
+            try:
+                # Try to parse as date
+                from datetime import datetime
+                for date_format in ['%Y-%m-%d', '%Y-%m', '%m/%d/%Y', '%d/%m/%Y', '%Y']:
+                    try:
+                        datetime.strptime(str(first_col), date_format)
+                        is_temporal = True
+                        break
+                    except ValueError:
+                        continue
+            except:
+                pass
+        
+        if is_temporal:
+            print("Chart type decision: LINE (temporal data structure detected)")
+            return "line"
+    
+    # Rule 3: Number of data points
+    if num_rows <= 6:  # Small number of categories - good for pie
+        print("Chart type decision: PIE (small number of categories)")
+        return "pie"
+    elif num_rows > 15:  # Many data points - better as bar chart
+        print("Chart type decision: BAR (many data points)")
+        return "bar"
+    
+    # Rule 4: Query context clues
+    if any(word in query_lower for word in ["sector", "source", "type", "category", "by"]):
+        if num_rows <= 8:
+            print("Chart type decision: PIE (categorical breakdown with few items)")
+            return "pie"
+        else:
+            print("Chart type decision: BAR (categorical breakdown with many items)")
+            return "bar"
+    
+    # Rule 5: Default based on data characteristics
+    if num_columns == 2 and num_rows <= 10:
+        print("Chart type decision: PIE (simple two-column data, few rows)")
+        return "pie"
+    
+    print("Chart type decision: BAR (default choice)")
+    return "bar"
 def process_sql_results_for_chart(raw_results, query: str):
     """Process SQL results into chart-friendly format with metadata"""
     if not raw_results or not isinstance(raw_results, list):
@@ -184,8 +302,17 @@ def process_sql_results_for_chart(raw_results, query: str):
     if any(word in query_lower for word in ["volume", "consumption", "energy"]):
         if "tj" in query_lower or "terajoule" in query_lower:
             metadata["yAxisTitle"] = "Volume (TJ)"
+        elif "mwh" in query_lower or "megawatt" in query_lower:
+            metadata["yAxisTitle"] = "Energy (MWh)"
         else:
             metadata["yAxisTitle"] = "Energy Volume"
+    elif any(word in query_lower for word in ["generation", "generated", "produce", "output"]):
+        if "mwh" in query_lower or "megawatt" in query_lower:
+            metadata["yAxisTitle"] = "Generation (MWh)"
+        elif "tj" in query_lower or "terajoule" in query_lower:
+            metadata["yAxisTitle"] = "Generation (TJ)"
+        else:
+            metadata["yAxisTitle"] = "Energy Generation"
     elif any(word in query_lower for word in ["price", "cost", "tariff"]):
         metadata["yAxisTitle"] = "Price"
     elif any(word in query_lower for word in ["count", "number", "quantity"]):
@@ -194,7 +321,12 @@ def process_sql_results_for_chart(raw_results, query: str):
         metadata["yAxisTitle"] = "Percentage (%)"
     
     # Determine chart title based on query content
-    if "residential" in query_lower:
+    if "hydro" in query_lower:
+        if "generation" in query_lower:
+            metadata["title"] = "Hydro Power Generation"
+        else:
+            metadata["title"] = "Hydro Energy Data"
+    elif "residential" in query_lower:
         metadata["title"] = "Residential Energy Data"
     elif "commercial" in query_lower:
         metadata["title"] = "Commercial Energy Data"
@@ -212,6 +344,8 @@ def process_sql_results_for_chart(raw_results, query: str):
         metadata["title"] = "Energy Prices"
     elif "trade" in query_lower or "import" in query_lower or "export" in query_lower:
         metadata["title"] = "Energy Trade Data"
+    elif "generation" in query_lower:
+        metadata["title"] = "Energy Generation"
     
     for row in raw_results:
         # Convert any Decimal objects to float
@@ -344,6 +478,7 @@ def ask(q: Question, x_app_key: str = Header(...)):
 
         # Check if this is a chart request
         is_chart, chart_type = is_chart_request(q.query)
+        print(f"Chart detection: is_chart={is_chart}, chart_type={chart_type}, query='{q.query}'")
         
         result = db_chain.invoke(SYSTEM_PROMPT + "\n\n" + q.query)
         
@@ -387,6 +522,12 @@ def ask(q: Question, x_app_key: str = Header(...)):
                                     
                                     if raw_results:
                                         chart_data, chart_metadata = process_sql_results_for_chart(raw_results, q.query)
+                                        
+                                        # Intelligently determine the best chart type
+                                        optimal_chart_type = intelligent_chart_type_selection(raw_results, q.query, chart_type)
+                                        chart_type = optimal_chart_type
+                                        
+                                        print(f"Selected chart type: {chart_type}")
                                         final_answer = "Here's your data visualization:"
                                         break
                             except Exception as e:
