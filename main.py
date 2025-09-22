@@ -460,16 +460,12 @@ def ask(q: Question, x_app_key: str = Header(...)):
     if not APP_SECRET_KEY or x_app_key != APP_SECRET_KEY:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
- try:
-    llm = ChatOpenAI(
-        model="gpt-5",
-        temperature=0,
-        openai_api_key=OPENAI_API_KEY
-    )
-    db_chain = SQLDatabaseChain.from_llm(
-        llm, db, verbose=True, use_query_checker=True
-    )
-
+    try:
+        llm = ChatOpenAI(
+            model="gpt-5",
+            temperature=0,
+            openai_api_key=OPENAI_API_KEY
+        )
 
         db_chain = SQLDatabaseChain.from_llm(
             llm=llm,
@@ -516,7 +512,6 @@ def ask(q: Question, x_app_key: str = Header(...)):
                 if intermediate_steps:
                     for step in intermediate_steps:
                         if isinstance(step, dict) and 'sql_cmd' in step:
-                            # Try to execute the SQL query directly to get raw results
                             try:
                                 sql_query = step['sql_cmd']
                                 with engine.connect() as conn:
