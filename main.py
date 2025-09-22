@@ -112,16 +112,20 @@ def ask(q: Question, x_app_key: str = Header(...)):
             openai_api_key=OPENAI_API_KEY
         )
 
+        # Step 1: Use LangChain to translate NL → SQL
         db_chain = SQLDatabaseChain.from_llm(
             llm=llm,
             db=db,
             verbose=True,
             use_query_checker=True,
-            top_k=50
+            top_k=50,
+            return_direct=False
         )
 
-        # Step 1: Ask LLM to generate SQL
-        sql_query = db_chain.prompt.format_prompt(question=q.query).to_string()
+        # Instead of using .prompt, just call run()
+        sql_query = db_chain.llm_chain.run(
+            SYSTEM_PROMPT + "\n\n" + q.query
+        )
         sql_query = clean_sql(sql_query)
 
         # Step 2: Run SQL directly on DB
@@ -131,7 +135,6 @@ def ask(q: Question, x_app_key: str = Header(...)):
                 result = conn.execute(text(sql_query))
                 rows = [dict(row._mapping) for row in result]
         except Exception as db_error:
-            # If SQL fails, still return error gracefully
             return {
                 "answer": f"Error running SQL query: {str(db_error)}",
                 "data": []
@@ -140,7 +143,8 @@ def ask(q: Question, x_app_key: str = Header(...)):
         # Step 3: Return both answer + structured rows
         return {
             "answer": f"Here is the data for: {q.query}",
-            "data": rows
+            "data": rows,
+            "sql": sql_query  # 👈 optional, helps debugging
         }
 
     except Exception as e:
