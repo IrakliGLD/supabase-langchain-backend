@@ -460,13 +460,16 @@ def ask(q: Question, x_app_key: str = Header(...)):
     if not APP_SECRET_KEY or x_app_key != APP_SECRET_KEY:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    try:
-       llm = ChatOpenAI(
-    model="gpt-5",
-    temperature=0,
-    openai_api_key=OPENAI_API_KEY,
-    model_kwargs={}  # prevents LangChain from sending defaults like stop=[]
-)
+ try:
+    llm = ChatOpenAI(
+        model="gpt-5",
+        temperature=0,
+        openai_api_key=OPENAI_API_KEY
+    )
+    db_chain = SQLDatabaseChain.from_llm(
+        llm, db, verbose=True, use_query_checker=True
+    )
+
 
         db_chain = SQLDatabaseChain.from_llm(
             llm=llm,
