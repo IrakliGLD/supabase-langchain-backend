@@ -1,8 +1,8 @@
 fastapi
 uvicorn
-SQLAlchemy>=2.0
-python-dotenv
-pydantic
+sqlalchemy
+psycopg2-binary
 llama-index-core
 llama-index-llms-openai
-psycopg2-binary
+llama-index-embeddings-openai
+python-dotenv
