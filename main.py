@@ -3,9 +3,6 @@ from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy import create_engine, text
-from langchain_openai import ChatOpenAI
-from langchain_community.utilities import SQLDatabase
-from langchain_experimental.sql import SQLDatabaseChain
 from dotenv import load_dotenv
 from decimal import Decimal
 import json
@@ -14,6 +11,11 @@ from datetime import datetime
 
 # Import DB documentation context
 from context import DB_SCHEMA_DOC
+
+# LlamaIndex imports
+from llama_index.core import SQLDatabase as LI_SQLDatabase
+from llama_index.llms.openai import OpenAI
+from llama_index.core.query_engine import NLSQLTableQueryEngine
 
 # Load .env file
 load_dotenv()
@@ -39,39 +41,17 @@ allowed_tables = [
     "tech_quantity",
     "trade"
 ]
-db = SQLDatabase(engine, include_tables=allowed_tables)
 
-# --- Patch execution to clean accidental markdown fences ---
-def clean_sql(query: str) -> str:
-    """Remove markdown fences if GPT accidentally adds them."""
-    return query.replace("```sql", "").replace("```", "").strip()
+# Wrap SQLAlchemy engine for LlamaIndex
+li_db = LI_SQLDatabase(engine, include_tables=allowed_tables)
 
-old_execute = db._execute
-def cleaned_execute(sql: str, *args, **kwargs):
-    sql = clean_sql(sql)
-    return old_execute(sql, *args, **kwargs)
-db._execute = cleaned_execute
-# ----------------------------------------------------------
-
-# FastAPI app
-app = FastAPI(title="Supabase LangChain Backend")
-
-# CORS settings (open for now)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[ALLOWED_ORIGINS] if ALLOWED_ORIGINS != "*" else ["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# Improved system prompt
+# Full system prompt merged with schema docs
 SYSTEM_PROMPT = f"""
-You are EnerBot, an expert Georgian electricity market data analyst with strict data integrity principles.
+You are EnerBot, an expert Georgian electricity market data analyst with advanced data visualization intelligence.
 
 === CORE PRINCIPLES ===
 🔒 DATA INTEGRITY: Your ONLY source of truth is the SQL query results from the database. Never use outside knowledge, assumptions, or estimates.
-📊 ACCURACY FIRST: Be precise with numbers, dates, and categories. Round decimals appropriately but maintain data fidelity.
+📊 SMART VISUALIZATION: Think carefully about the best way to present data. Consider the nature of the data and user's analytical needs.
 🎯 RELEVANT RESULTS: Focus on what the user actually asked for. Don't provide tangential information.
 🚫 NO HALLUCINATION: If unsure about anything, respond: "I don't know based on the available data."
 
@@ -84,57 +64,70 @@ You are EnerBot, an expert Georgian electricity market data analyst with strict 
 ✅ LOGICAL JOINS: Only join tables when schema relationships clearly support it.
 ✅ PERFORMANCE AWARE: Use LIMIT clauses for large datasets, especially for charts.
 
-=== RESPONSE FORMATTING ===
+=== DATA PRESENTATION INTELLIGENCE ===
+🧠 THINK ABOUT THE STORY: What is the user trying to understand?
+- Trends over time → Line charts show progression and patterns
+- Comparisons between categories → Bar charts show relative magnitudes
+- Proportional breakdowns → Pie charts show parts of a whole
+- Distribution analysis → Consider the number of categories and data density
 
-📝 FOR TEXT ANSWERS (when user does NOT request charts):
+🧠 CONSIDER DATA CHARACTERISTICS:
+- Time series data (monthly, yearly) → Line charts reveal trends
+- Few categories (2-6 items) → Pie charts work well for composition
+- Many categories (>10 items) → Bar charts prevent overcrowding
+- Comparison queries → Bar charts highlight differences
+
+🧠 QUERY CONTEXT CLUES:
+- Words like "trend", "over time", "monthly", "progression" → Think time series visualization
+- Words like "share", "proportion", "breakdown", "composition" → Think proportional visualization
+- Words like "compare", "vs", "between", "against" → Think comparative visualization
+- Words like "generation", "consumption" with time periods → Think trend analysis
+
+=== RESPONSE FORMATTING ===
+📝 FOR TEXT ANSWERS:
 - Provide clear, structured summaries
 - Use bullet points or tables for multiple data points
 - Include context: time periods, sectors, units of measurement
-- Round numbers appropriately (e.g., "1,083.9 TJ" not "1083.87439 TJ")
-- Highlight key insights or trends when relevant
+- Round numbers appropriately
+- Highlight key insights or trends
 
-📈 FOR CHART REQUESTS (when user mentions: chart, plot, graph, visualize, show as):
-- Let the backend handle data formatting - just return natural language summary
-- Mention what time period, sectors, or categories are included
-- Note any significant patterns or outliers
-- Keep explanations brief since the chart will show the details
-
-=== QUERY OPTIMIZATION ===
-🔍 TIME SERIES: For monthly/yearly trends, ensure proper date ordering (ORDER BY date/period)
-🔍 CATEGORIZATION: Group by relevant dimensions (sector, energy_source, entity)
-🔍 AGGREGATION: Sum volumes, average prices, count occurrences as appropriate
-🔍 FILTERING: Apply reasonable date ranges if not specified (e.g., last 12 months)
-
-=== COMMON PATTERNS ===
-• Energy consumption by sector → GROUP BY sector, SUM(volume_tj)
-• Monthly trends → GROUP BY date/period, ORDER BY date
-• Price comparisons → SELECT entity, price, date for relevant periods
-• Market share → Calculate percentages using window functions
-• Import/export data → Use trade table with appropriate entity filters
-
-=== ERROR HANDLING ===
-❌ No data found → "I don't have data for that specific request."
-❌ Ambiguous request → Ask for clarification: "Could you specify the time period/sector?"
-❌ Invalid parameters → Suggest alternatives based on available data
+📈 FOR CHART REQUESTS:
+- Provide concise description
+- Ensure data is returned in structured format (date/category + value)
+- Keep explanations minimal when chart is requested
 
 === SCHEMA DOCUMENTATION ===
 {DB_SCHEMA_DOC}
 
-=== EXAMPLES ===
-Good: "Residential sector consumed 131,937.2 TJ in 2022, representing 45% of total energy use."
-Bad: "Energy consumption is typically high in residential areas due to heating and cooling needs."
-
-Good: "Natural gas prices ranged from $2.15 to $4.78 per unit between Jan-Dec 2022."
-Bad: "Natural gas prices have been volatile recently due to global market conditions."
-
-REMEMBER: You are a data analyst, not a general energy expert. Stick to what the data shows!
+REMEMBER: You are a data analyst with visualization expertise. Stick strictly to the database data!
 """
+
+# Initialize LLM + Query engine
+llm = OpenAI(model="gpt-5-mini", api_key=OPENAI_API_KEY, temperature=0)
+
+query_engine = NLSQLTableQueryEngine(
+    sql_database=li_db,
+    llm=llm,
+    context_str=SYSTEM_PROMPT,
+    verbose=True,
+)
+
+# FastAPI app
+app = FastAPI(title="Supabase LlamaIndex Backend")
+
+# CORS settings
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[ALLOWED_ORIGINS] if ALLOWED_ORIGINS != "*" else ["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 class Question(BaseModel):
     query: str
 
 def convert_decimal_to_float(obj):
-    """Recursively convert Decimal objects to float"""
     if isinstance(obj, Decimal):
         return float(obj)
     elif isinstance(obj, list):
@@ -146,104 +139,34 @@ def convert_decimal_to_float(obj):
     return obj
 
 def is_chart_request(query: str) -> tuple[bool, str]:
-    """Detect if user is asking for a chart and determine type"""
     query_lower = query.lower()
-    
-    # Chart request keywords
     chart_keywords = ["chart", "plot", "graph", "visualize", "show as", "display as"]
     is_chart = any(keyword in query_lower for keyword in chart_keywords)
     
     if not is_chart:
         return False, None
-    
-    # Determine chart type
-    if any(word in query_lower for word in ["pie", "pie chart"]):
+    if "pie" in query_lower:
         return True, "pie"
-    elif any(word in query_lower for word in ["line", "line chart", "trend"]):
+    elif "line" in query_lower or "trend" in query_lower:
         return True, "line"
     else:
-        return True, "bar"  # default
+        return True, "bar"
 
 def process_sql_results_for_chart(raw_results, query: str):
-    """Process SQL results into chart-friendly format"""
     if not raw_results or not isinstance(raw_results, list):
         return []
-    
     chart_data = []
-    
     for row in raw_results:
-        # Convert any Decimal objects to float
         row = convert_decimal_to_float(row)
-        
         if not isinstance(row, (list, tuple)) or len(row) < 2:
             continue
-            
-        # Case 1: Two columns - could be (date, value) or (category, value)
         if len(row) == 2:
             col1, col2 = row
-            
-            # Try to detect if first column is a date
-            is_date = False
-            if isinstance(col1, str):
-                try:
-                    # Try parsing various date formats
-                    for date_format in ['%Y-%m-%d', '%Y-%m', '%m/%d/%Y', '%d/%m/%Y']:
-                        try:
-                            datetime.strptime(col1, date_format)
-                            is_date = True
-                            break
-                        except ValueError:
-                            continue
-                except:
-                    pass
-            
-            if is_date:
-                chart_data.append({"date": str(col1), "value": float(col2)})
-            else:
-                # Categorical data
-                chart_data.append({"sector": str(col1), "volume_tj": float(col2)})
-        
-        # Case 2: Three columns - often (period/year, category, value)
+            chart_data.append({"x": str(col1), "y": float(col2)})
         elif len(row) == 3:
             col1, col2, col3 = row
-            
-            # Check if first column looks like a date/period
-            if isinstance(col1, str) and ('-' in col1 or '/' in col1):
-                chart_data.append({"date": str(col1), "sector": str(col2), "value": float(col3)})
-            else:
-                # Treat as (year, sector, value) or similar
-                chart_data.append({"sector": str(col2), "volume_tj": float(col3)})
-        
-        # Case 3: Four or more columns - assume (period, sector, source, value)
-        elif len(row) >= 4:
-            period, sector, source, value = row[:4]
-            chart_data.append({
-                "date": str(period),
-                "sector": str(sector), 
-                "energy_source": str(source),
-                "volume_tj": float(value)
-            })
-    
+            chart_data.append({"x": str(col1), "group": str(col2), "y": float(col3)})
     return chart_data
-
-def extract_json_from_text(text: str):
-    """Extract JSON array from text response if present"""
-    if not text:
-        return None
-        
-    # Look for JSON array patterns
-    json_pattern = r'\[[\s\S]*?\]'
-    matches = re.findall(json_pattern, text)
-    
-    for match in matches:
-        try:
-            parsed = json.loads(match)
-            if isinstance(parsed, list) and len(parsed) > 0:
-                return convert_decimal_to_float(parsed)
-        except json.JSONDecodeError:
-            continue
-    
-    return None
 
 @app.get("/healthz")
 def health():
@@ -257,84 +180,42 @@ def health():
 @app.get("/introspect")
 def introspect():
     try:
-        schema = db.get_table_info()
+        schema = li_db.get_table_info()
         return {"schema": schema}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/ask")
 def ask(q: Question, x_app_key: str = Header(...)):
-    # 🔒 API Key Authentication
     if not APP_SECRET_KEY or x_app_key != APP_SECRET_KEY:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     try:
-        llm = ChatOpenAI(
-            model="gpt-4o-mini",
-            temperature=0,
-            openai_api_key=OPENAI_API_KEY
-        )
-
-        db_chain = SQLDatabaseChain.from_llm(
-            llm=llm,
-            db=db,
-            verbose=True,
-            use_query_checker=True,
-            top_k=50,
-            return_intermediate_steps=True
-        )
-
-        # Check if this is a chart request
         is_chart, chart_type = is_chart_request(q.query)
-        
-        result = db_chain.invoke(SYSTEM_PROMPT + "\n\n" + q.query)
-        
-        # Get the raw result
-        raw_answer = result.get("result", "")
-        intermediate_steps = result.get("intermediate_steps", [])
-        
-        print(f"Raw answer: {raw_answer}")
-        print(f"Intermediate steps: {intermediate_steps}")
-        
+
+        response = query_engine.query(q.query)
+        raw_answer = str(response)
+
         chart_data = []
         final_answer = raw_answer
-        
-        if is_chart:
-            # First, try to extract JSON from the text answer
-            json_data = extract_json_from_text(str(raw_answer))
-            if json_data:
-                chart_data = json_data
-                final_answer = "Here's your data visualization:"
-            else:
-                # If no JSON in answer, try to get raw SQL results
-                if intermediate_steps:
-                    for step in intermediate_steps:
-                        if isinstance(step, dict) and 'sql_cmd' in step:
-                            # Try to execute the SQL query directly to get raw results
-                            try:
-                                sql_query = step['sql_cmd']
-                                with engine.connect() as conn:
-                                    result_proxy = conn.execute(text(sql_query))
-                                    raw_results = result_proxy.fetchall()
-                                    print(f"Raw SQL results: {raw_results}")
-                                    
-                                    if raw_results:
-                                        chart_data = process_sql_results_for_chart(raw_results, q.query)
-                                        final_answer = "Here's your data visualization:"
-                                        break
-                            except Exception as e:
-                                print(f"Error executing SQL directly: {e}")
-                                continue
-        
-        # Clean up the response
-        response = {
+
+        if is_chart and hasattr(response, "metadata") and "sql_query" in response.metadata:
+            sql_query = response.metadata["sql_query"]
+            try:
+                with engine.connect() as conn:
+                    result_proxy = conn.execute(text(sql_query))
+                    raw_results = result_proxy.fetchall()
+                    if raw_results:
+                        chart_data = process_sql_results_for_chart(raw_results, q.query)
+                        final_answer = "Here's your data visualization:"
+            except Exception as e:
+                print(f"Error executing SQL directly: {e}")
+
+        return {
             "answer": final_answer if not chart_data else "Here's your data visualization:",
             "chartType": chart_type if chart_data else None,
             "data": chart_data if chart_data else None
         }
-        
-        print(f"Final response: {response}")
-        return response
 
     except Exception as e:
         print(f"Error in ask endpoint: {e}")
