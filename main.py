@@ -112,40 +112,33 @@ def ask(q: Question, x_app_key: str = Header(...)):
             openai_api_key=OPENAI_API_KEY
         )
 
-        # Step 1: Use LangChain to translate NL → SQL
         db_chain = SQLDatabaseChain.from_llm(
             llm=llm,
             db=db,
             verbose=True,
             use_query_checker=True,
             top_k=50,
-            return_direct=False
+            return_direct=True  # 👈 ensures we can get raw SQL rows
         )
 
-        # Instead of using .prompt, just call run()
-        sql_query = db_chain.llm_chain.run(
-            SYSTEM_PROMPT + "\n\n" + q.query
-        )
-        sql_query = clean_sql(sql_query)
+        result = db_chain.run(SYSTEM_PROMPT + "\n\n" + q.query)
 
-        # Step 2: Run SQL directly on DB
-        rows = []
-        try:
-            with engine.connect() as conn:
-                result = conn.execute(text(sql_query))
-                rows = [dict(row._mapping) for row in result]
-        except Exception as db_error:
-            return {
-                "answer": f"Error running SQL query: {str(db_error)}",
-                "data": []
-            }
-
-        # Step 3: Return both answer + structured rows
-        return {
-            "answer": f"Here is the data for: {q.query}",
-            "data": rows,
-            "sql": sql_query  # 👈 optional, helps debugging
+        # Always return both keys
+        response = {
+            "answer": None,
+            "chartData": None
         }
+
+        # Case 1: chart-friendly tabular data
+        if isinstance(result, list) and all(isinstance(r, dict) for r in result):
+            response["answer"] = "Here’s the chart:"
+            response["chartData"] = result
+        else:
+            # Case 2: plain string/text
+            response["answer"] = str(result)
+            response["chartData"] = None
+
+        return response
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
