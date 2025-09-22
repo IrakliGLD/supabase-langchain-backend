@@ -65,7 +65,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Enhanced system prompt (unchanged)
+# Enhanced system prompt with intelligent chart selection guidance
 SYSTEM_PROMPT = f"""
 You are EnerBot, an expert Georgian electricity market data analyst with advanced data visualization intelligence.
 
@@ -84,6 +84,7 @@ You are EnerBot, an expert Georgian electricity market data analyst with advance
 ✅ LOGICAL JOINS: Only join tables when schema relationships clearly support it.
 ✅ PERFORMANCE AWARE: Use LIMIT clauses for large datasets, especially for charts.
 ✅ Tables that store dates (like `tech_quantity`) do not have a `year` column. Always use EXTRACT(YEAR FROM date) AS year when grouping or filtering by year.
+
 
 === DATA PRESENTATION INTELLIGENCE ===
 🧠 THINK ABOUT THE STORY: What is the user trying to understand?
@@ -171,17 +172,20 @@ def is_chart_request(query: str) -> tuple[bool, str]:
     """Detect if user is asking for a chart and determine type"""
     query_lower = query.lower()
     
+    # Chart request keywords - expanded list
     chart_keywords = [
         "chart", "plot", "graph", "visualize", "visualization", 
         "show as", "display as", "present as", "draw", "render as"
     ]
     
+    # More specific chart patterns
     chart_patterns = [
         "bar chart", "line chart", "pie chart",
         "show as bar", "show as line", "show as pie",
         "display as chart", "visualize as", "plot as"
     ]
     
+    # Check for explicit chart patterns first
     for pattern in chart_patterns:
         if pattern in query_lower:
             if "pie" in pattern:
@@ -191,26 +195,35 @@ def is_chart_request(query: str) -> tuple[bool, str]:
             else:
                 return True, "bar"
     
+    # Check for general chart keywords
     is_chart = any(keyword in query_lower for keyword in chart_keywords)
-    return is_chart, "auto" if is_chart else None
+    
+    if not is_chart:
+        return False, None
+    
+    # Let the model decide the best chart type based on context
+    return True, "auto"  # Changed from specific type to "auto"
 
 def intelligent_chart_type_selection(raw_results, query: str, explicit_type: str = None):
     """Intelligently select the best chart type based on data characteristics and query context"""
+    
     if explicit_type and explicit_type != "auto":
-        print(f"Chart type decision: {explicit_type} (explicitly specified)")
         return explicit_type
     
     if not raw_results or not isinstance(raw_results, list) or len(raw_results) == 0:
-        print("Chart type decision: BAR (no data available)")
-        return "bar"
+        return "bar"  # default
     
     query_lower = query.lower()
+    
+    # Analyze data structure
     sample_row = raw_results[0] if raw_results else []
     num_columns = len(sample_row) if isinstance(sample_row, (list, tuple)) else 0
     num_rows = len(raw_results)
     
-    print(f"Chart type analysis: {num_rows} rows, {num_columns} columns, sample: {sample_row}")
+    print(f"Chart type analysis: {num_rows} rows, {num_columns} columns")
+    print(f"Sample row: {sample_row}")
     
+    # Rule 1: Explicit user preferences in query
     if any(word in query_lower for word in ["trend", "over time", "monthly", "yearly", "timeline", "progression"]):
         print("Chart type decision: LINE (temporal trend detected)")
         return "line"
@@ -223,11 +236,16 @@ def intelligent_chart_type_selection(raw_results, query: str, explicit_type: str
         print("Chart type decision: BAR (comparison detected)")
         return "bar"
     
+    # Rule 2: Data structure analysis
     if num_columns >= 2:
         first_col = sample_row[0] if sample_row else None
+        
+        # Check if first column looks like a date/time
         is_temporal = False
         if isinstance(first_col, str):
             try:
+                # Try to parse as date
+                from datetime import datetime
                 for date_format in ['%Y-%m-%d', '%Y-%m', '%m/%d/%Y', '%d/%m/%Y', '%Y']:
                     try:
                         datetime.strptime(str(first_col), date_format)
@@ -242,13 +260,15 @@ def intelligent_chart_type_selection(raw_results, query: str, explicit_type: str
             print("Chart type decision: LINE (temporal data structure detected)")
             return "line"
     
-    if num_rows <= 6:
+    # Rule 3: Number of data points
+    if num_rows <= 6:  # Small number of categories - good for pie
         print("Chart type decision: PIE (small number of categories)")
         return "pie"
-    elif num_rows > 15:
+    elif num_rows > 15:  # Many data points - better as bar chart
         print("Chart type decision: BAR (many data points)")
         return "bar"
     
+    # Rule 4: Query context clues
     if any(word in query_lower for word in ["sector", "source", "type", "category", "by"]):
         if num_rows <= 8:
             print("Chart type decision: PIE (categorical breakdown with few items)")
@@ -257,11 +277,18 @@ def intelligent_chart_type_selection(raw_results, query: str, explicit_type: str
             print("Chart type decision: BAR (categorical breakdown with many items)")
             return "bar"
     
+    # Rule 5: Default based on data characteristics
+    if num_columns == 2 and num_rows <= 10:
+        print("Chart type decision: PIE (simple two-column data, few rows)")
+        return "pie"
+    
     print("Chart type decision: BAR (default choice)")
     return "bar"
-
 def process_sql_results_for_chart(raw_results, query: str):
     """Process SQL results into chart-friendly format with metadata"""
+    if not raw_results or not isinstance(raw_results, list):
+        return [], {}
+    
     chart_data = []
     metadata = {
         "title": "Energy Data",
@@ -270,12 +297,10 @@ def process_sql_results_for_chart(raw_results, query: str):
         "datasetLabel": "Data"
     }
     
-    if not raw_results or not isinstance(raw_results, list):
-        print("Warning: No valid SQL results for chart")
-        return chart_data, metadata
-    
+    # Analyze query to determine appropriate labels
     query_lower = query.lower()
     
+    # Determine Y-axis title based on common patterns
     if any(word in query_lower for word in ["volume", "consumption", "energy"]):
         if "tj" in query_lower or "terajoule" in query_lower:
             metadata["yAxisTitle"] = "Volume (TJ)"
@@ -297,8 +322,12 @@ def process_sql_results_for_chart(raw_results, query: str):
     elif any(word in query_lower for word in ["percentage", "percent", "share"]):
         metadata["yAxisTitle"] = "Percentage (%)"
     
+    # Determine chart title based on query content
     if "hydro" in query_lower:
-        metadata["title"] = "Hydro Power Generation" if "generation" in query_lower else "Hydro Energy Data"
+        if "generation" in query_lower:
+            metadata["title"] = "Hydro Power Generation"
+        else:
+            metadata["title"] = "Hydro Energy Data"
     elif "residential" in query_lower:
         metadata["title"] = "Residential Energy Data"
     elif "commercial" in query_lower:
@@ -321,16 +350,21 @@ def process_sql_results_for_chart(raw_results, query: str):
         metadata["title"] = "Energy Generation"
     
     for row in raw_results:
+        # Convert any Decimal objects to float
         row = convert_decimal_to_float(row)
+        
         if not isinstance(row, (list, tuple)) or len(row) < 2:
-            print(f"Warning: Invalid row format: {row}")
             continue
             
+        # Case 1: Two columns - could be (date, value) or (category, value)
         if len(row) == 2:
             col1, col2 = row
+            
+            # Try to detect if first column is a date
             is_date = False
             if isinstance(col1, str):
                 try:
+                    # Try parsing various date formats
                     for date_format in ['%Y-%m-%d', '%Y-%m', '%m/%d/%Y', '%d/%m/%Y']:
                         try:
                             datetime.strptime(col1, date_format)
@@ -342,43 +376,48 @@ def process_sql_results_for_chart(raw_results, query: str):
                     pass
             
             if is_date:
-                chart_data.append({"date": str(col1), "value": float(col2) if col2 is not None else 0})
+                chart_data.append({"date": str(col1), "value": float(col2)})
                 metadata["xAxisTitle"] = "Date"
                 metadata["datasetLabel"] = "Value over Time"
                 if not metadata.get("title_set"):
                     metadata["title"] = "Time Series Analysis"
             else:
-                chart_data.append({"sector": str(col1), "volume_tj": float(col2) if col2 is not None else 0})
+                # Categorical data
+                chart_data.append({"sector": str(col1), "volume_tj": float(col2)})
                 metadata["xAxisTitle"] = "Sector" if "sector" in query_lower else "Category"
                 metadata["datasetLabel"] = "Energy Volume"
         
+        # Case 2: Three columns - often (period/year, category, value)
         elif len(row) == 3:
             col1, col2, col3 = row
+            
+            # Check if first column looks like a date/period
             if isinstance(col1, str) and ('-' in col1 or '/' in col1):
-                chart_data.append({"date": str(col1), "sector": str(col2), "value": float(col3) if col3 is not None else 0})
+                chart_data.append({"date": str(col1), "sector": str(col2), "value": float(col3)})
                 metadata["xAxisTitle"] = "Date"
                 metadata["datasetLabel"] = str(col2)
                 if not metadata.get("title_set"):
                     metadata["title"] = "Time Series by Category"
             else:
-                chart_data.append({"sector": str(col2), "volume_tj": float(col3) if col3 is not None else 0})
+                # Treat as (year, sector, value) or similar
+                chart_data.append({"sector": str(col2), "volume_tj": float(col3)})
                 metadata["xAxisTitle"] = "Sector"
                 metadata["datasetLabel"] = "Energy Volume"
         
+        # Case 3: Four or more columns - assume (period, sector, source, value)
         elif len(row) >= 4:
             period, sector, source, value = row[:4]
             chart_data.append({
                 "date": str(period),
                 "sector": str(sector), 
                 "energy_source": str(source),
-                "volume_tj": float(value) if value is not None else 0
+                "volume_tj": float(value)
             })
             metadata["xAxisTitle"] = "Date"
             metadata["datasetLabel"] = "Energy Sources"
             if not metadata.get("title_set"):
                 metadata["title"] = "Energy Sources Over Time"
     
-    print(f"Processed chart data: {chart_data}")
     return chart_data, metadata
 
 def extract_json_from_text(text: str):
@@ -386,6 +425,7 @@ def extract_json_from_text(text: str):
     if not text:
         return None
         
+    # Look for JSON array patterns
     json_pattern = r'\[[\s\S]*?\]'
     matches = re.findall(json_pattern, text)
     
@@ -418,6 +458,7 @@ def introspect():
 
 @app.post("/ask")
 def ask(q: Question, x_app_key: str = Header(...)):
+    # 🔒 API Key Authentication
     if not APP_SECRET_KEY or x_app_key != APP_SECRET_KEY:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
@@ -437,11 +478,13 @@ def ask(q: Question, x_app_key: str = Header(...)):
             return_intermediate_steps=True
         )
 
+        # Check if this is a chart request
         is_chart, chart_type = is_chart_request(q.query)
         print(f"Chart detection: is_chart={is_chart}, chart_type={chart_type}, query='{q.query}'")
         
         result = db_chain.invoke(SYSTEM_PROMPT + "\n\n" + q.query)
         
+        # Get the raw result
         raw_answer = result.get("result", "")
         intermediate_steps = result.get("intermediate_steps", [])
         
@@ -449,14 +492,16 @@ def ask(q: Question, x_app_key: str = Header(...)):
         print(f"Intermediate steps: {intermediate_steps}")
         
         chart_data = []
-        chart_metadata = {}
         final_answer = raw_answer
         
         if is_chart:
+            # First, try to extract JSON from the text answer
             json_data = extract_json_from_text(str(raw_answer))
+            chart_metadata = {}
             
             if json_data:
                 chart_data = json_data
+                # Create basic metadata for JSON data
                 chart_metadata = {
                     "title": "Energy Data Visualization",
                     "xAxisTitle": "Category",
@@ -465,9 +510,11 @@ def ask(q: Question, x_app_key: str = Header(...)):
                 }
                 final_answer = "Here's your data visualization:"
             else:
+                # If no JSON in answer, try to get raw SQL results
                 if intermediate_steps:
                     for step in intermediate_steps:
                         if isinstance(step, dict) and 'sql_cmd' in step:
+                            # Try to execute the SQL query directly to get raw results
                             try:
                                 sql_query = step['sql_cmd']
                                 with engine.connect() as conn:
@@ -477,15 +524,21 @@ def ask(q: Question, x_app_key: str = Header(...)):
                                     
                                     if raw_results:
                                         chart_data, chart_metadata = process_sql_results_for_chart(raw_results, q.query)
-                                        chart_type = intelligent_chart_type_selection(raw_results, q.query, chart_type)
+                                        
+                                        # Intelligently determine the best chart type
+                                        optimal_chart_type = intelligent_chart_type_selection(raw_results, q.query, chart_type)
+                                        chart_type = optimal_chart_type
+                                        
+                                        print(f"Selected chart type: {chart_type}")
                                         final_answer = "Here's your data visualization:"
                                         break
                             except Exception as e:
                                 print(f"Error executing SQL directly: {e}")
                                 continue
         
+        # Clean up the response
         response = {
-            "answer": final_answer,
+            "answer": final_answer if not chart_data else "Here's your data visualization:",
             "chartType": chart_type if chart_data else None,
             "data": chart_data if chart_data else None,
             "chartMetadata": chart_metadata if chart_data else None
