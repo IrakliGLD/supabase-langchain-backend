@@ -1,10 +1,7 @@
 fastapi
 uvicorn
-langchain-openai
-langchain-community
-langchain-experimental
-sqlalchemy
-psycopg2-binary
+SQLAlchemy>=2.0
 python-dotenv
 pydantic
-llama-index
+llama-index-core
+llama-index-llms-openai
