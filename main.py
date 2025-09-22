@@ -93,43 +93,28 @@ ANSWERING RULES
    - Convert raw decimals into readable numbers with reasonable rounding.
 
 3. If results exist AND the user DID ask for a chart (mentions chart, plot, graph, bar, pie, line, etc.):
-   - Return ONLY the raw SQL rows as a JSON array of tuples/lists.
+   - Return ONLY the raw SQL rows as a JSON array of objects with explicit keys.
    - Do not include narration, explanations, or units.
-   - Example:
-       [[2021, "Residential", 131937.2],
-        [2021, "Road", 109821.3]]
+   - Examples:
+       - Time series: [{{"date": "2021-04-01", "value": 753.3}}, {{"date": "2021-05-01", "value": 1211.7}}]
+       - Categorical: [{{"sector": "Residential", "volume_tj": 131937.2}}, {{"sector": "Road", "volume_tj": 109821.3}}]
+       - Sector+source: [{{"sector": "Residential", "energy_source": "Electricity", "volume_tj": 5000.0}}]
 
-4. Chart type:
-   - If user mentions "pie" → return sector/value style data.
-   - If user mentions "bar" → return grouped or time series data.
-   - If user mentions "line" → return time series data with date + value.
-   - If unclear but "chart/plot/graph" mentioned → default to bar chart data.
-
-Chart-specific rule:
-- If the user asks for a chart, plot, or graph, you must return the raw SQL rows
-  converted into JSON objects with explicit keys, not just lists.
-- For time series (date + value):
-  Example: [{{"date": "2021-04-01", "value": 753.3}}, {{"date": "2021-05-01", "value": 1211.7}}]
-- For categorical (sector + value):
-  Example: [{{"sector": "Residential", "volume_tj": 131937.2}}, {{"sector": "Road", "volume_tj": 109821.3}}]
-- For sector + source breakdowns:
-  Example: [{{"sector": "Residential", "energy_source": "Electricity", "volume_tj": 5000.0}}]
-- Never add explanations, text, or narration when chart output is requested.
-- Always ensure keys are consistent and lowercase (date, sector, energy_source, value, volume_tj).
-
-
+4. Chart type selection:
+   - "pie" → sector/value style
+   - "bar" → grouped or time series data
+   - "line" → time series with date + value
+   - if user only says "chart/plot/graph" → default to "bar"
 
 FORMATTING RULES
 - For text answers: short bullet points or compact lists.
 - For chart answers: strict JSON array, nothing else.
-- For dates: keep ISO style (YYYY-MM-DD) unless user asks otherwise.
+- For dates: keep ISO style (YYYY-MM-DD).
 - For decimals: return numeric values as floats.
 
 SCHEMA DOCUMENTATION
 {DB_SCHEMA_DOC}
 """
-
-
 
 class Question(BaseModel):
     query: str
@@ -158,7 +143,6 @@ def ask(q: Question, x_app_key: str = Header(...)):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     try:
-        # Always use server's own OpenAI key
         llm = ChatOpenAI(
             model="gpt-4o-mini",
             temperature=0,
@@ -181,27 +165,28 @@ def ask(q: Question, x_app_key: str = Header(...)):
         chart_type = None
         chart_data = []
 
-        if "chart" in q.query.lower():
-            chart_type = "pie" if "pie" in q.query.lower() else "bar"
+        if "chart" in q.query.lower() or "plot" in q.query.lower() or "graph" in q.query.lower():
+            if "pie" in q.query.lower():
+                chart_type = "pie"
+            elif "line" in q.query.lower():
+                chart_type = "line"
+            else:
+                chart_type = "bar"
 
+            # Ensure JSON-style output
             if isinstance(raw_answer, list):
                 for row in raw_answer:
-                    # Convert decimals & tuples into dicts
                     row = [float(x) if isinstance(x, Decimal) else x for x in row]
 
-                    # Case 1: ('Residential', 131937.2)
-                    if len(row) == 2:
-                        label, value = row
-                        chart_data.append({"label": str(label), "value": float(value)})
-
-                    # Case 2: (2022, 'Residential', 131937.2)
-                    elif len(row) >= 3:
-                        _, sector, value = row[:3]
-                        chart_data.append({"sector": str(sector), "volume_tj": float(value)})
+                    if chart_type in ["bar", "line"] and len(row) >= 2:
+                        if isinstance(row[0], (str, int)):
+                            chart_data.append({"date": str(row[0]), "value": float(row[1])})
+                    elif chart_type == "pie" and len(row) >= 2:
+                        chart_data.append({"sector": str(row[0]), "volume_tj": float(row[1])})
         # -----------------------------------------------------
 
         return {
-            "answer": str(raw_answer),
+            "answer": str(raw_answer) if not chart_data else "Here’s the chart:",
             "chartType": chart_type,
             "data": chart_data
         }
