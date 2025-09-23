@@ -205,9 +205,12 @@ def ask(q: Question, x_app_key: str = Header(...)):
         )
 
         # Run agent
-        result = agent.invoke(q.query)
-        response_text = result["output"]  # natural language answer
-        steps = result["intermediate_steps"]
+        result = agent.invoke({"input": q.query}, return_intermediate_steps=True)
+
+        # Extract safe values
+        response_text = result.get("output", "")
+
+steps = result.get("intermediate_steps", [])
 
         # Default payload
         result_payload = {
