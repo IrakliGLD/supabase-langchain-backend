@@ -84,6 +84,7 @@ You are EnerBot, an expert Georgian electricity market data analyst with advance
 class Question(BaseModel):
     query: str
 
+# ---------- Helpers ----------
 def convert_decimal_to_float(obj):
     if isinstance(obj, Decimal):
         return float(obj)
@@ -94,6 +95,13 @@ def convert_decimal_to_float(obj):
     elif isinstance(obj, dict):
         return {k: convert_decimal_to_float(v) for k, v in obj.items()}
     return obj
+
+def format_number(value: float, unit: str = None) -> str:
+    """Format number with 1 decimal place, thousands separator, and optional unit."""
+    if value is None:
+        return "0"
+    formatted = f"{value:,.1f}"
+    return f"{formatted} {unit}" if unit else formatted
 
 def is_chart_request(query: str) -> tuple[bool, str]:
     query_lower = query.lower()
@@ -136,29 +144,32 @@ def intelligent_chart_type_selection(raw_results, query: str, explicit_type: str
         return "pie"
     return "bar"
 
-def process_sql_results_for_chart(raw_results, query: str):
+def process_sql_results_for_chart(raw_results, query: str, unit: str = "TJ"):
+    """Transform SQL results into chart-friendly JSON + metadata."""
     chart_data = []
     metadata = {
         "title": "Energy Data Visualization",
         "xAxisTitle": "Category",
-        "yAxisTitle": "Value",
+        "yAxisTitle": f"Value ({unit})",
         "datasetLabel": "Data"
     }
     for row in raw_results:
         row = convert_decimal_to_float(row)
         if len(row) >= 2:
             col1, col2 = row[0], row[1]
+            val = round(float(col2), 1) if col2 else 0.0
             if isinstance(col1, str):
                 try:
                     datetime.strptime(col1, '%Y-%m-%d')
-                    chart_item = {"date": str(col1), "value": round(float(col2), 2) if col2 else 0.0}
+                    chart_item = {"date": str(col1), "value": val}
                     chart_data.append(chart_item)
                     metadata["xAxisTitle"] = "Date"
                 except:
-                    chart_item = {"sector": str(col1), "volume_tj": round(float(col2), 2) if col2 else 0.0}
+                    chart_item = {"sector": str(col1), "value": val}
                     chart_data.append(chart_item)
                     metadata["xAxisTitle"] = "Category"
     return chart_data, metadata
+# ------------------------------
 
 @app.get("/healthz")
 def health():
@@ -177,7 +188,7 @@ def ask(q: Question, x_app_key: str = Header(...)):
     try:
         is_chart, chart_type = is_chart_request(q.query)
 
-        # Configure LLM + SQL Agent
+        # Configure LLM + SQL Agent with intermediate steps
         llm = ChatOpenAI(
             model="gpt-4o",
             temperature=0,
@@ -189,41 +200,50 @@ def ask(q: Question, x_app_key: str = Header(...)):
             toolkit=toolkit,
             verbose=True,
             agent_type="openai-tools",
-            system_message=SYSTEM_PROMPT
+            system_message=SYSTEM_PROMPT,
+            return_intermediate_steps=True
         )
 
         # Run agent
-        response = agent.run(q.query)
+        result = agent.invoke(q.query)
+        response_text = result["output"]  # natural language answer
+        steps = result["intermediate_steps"]
 
-        # Default response payload
+        # Default payload
         result_payload = {
-            "answer": response,
+            "answer": response_text,
             "chartType": None,
             "data": None,
             "chartMetadata": None
         }
 
-        # If chart requested, try to execute SQL again to get raw results
-        if is_chart:
+        # If chart requested, fetch SQL result for visualization
+        if is_chart and steps:
             try:
-                # Extract last SQL statement executed by agent
-                with engine.connect() as conn:
-                    # Very naive: assume agent's response includes SQL
-                    # Better: wrap with return_intermediate_steps=True
-                    # For now: scan for SELECT statement
-                    sql_match = None
-                    for line in response.splitlines():
-                        if "SELECT" in line.upper():
-                            sql_match = line
-                            break
-                    if sql_match:
-                        result_proxy = conn.execute(text(clean_sql(sql_match)))
+                last_step = steps[-1]
+                sql_cmd = None
+                if isinstance(last_step, tuple) and "sql_cmd" in last_step[0]:
+                    sql_cmd = last_step[0]["sql_cmd"]
+                elif isinstance(last_step, dict) and "sql_cmd" in last_step:
+                    sql_cmd = last_step["sql_cmd"]
+
+                if sql_cmd:
+                    with engine.connect() as conn:
+                        result_proxy = conn.execute(text(clean_sql(sql_cmd)))
                         raw_results = result_proxy.fetchall()
                         if raw_results:
-                            chart_data, chart_metadata = process_sql_results_for_chart(raw_results, q.query)
+                            chart_data, chart_metadata = process_sql_results_for_chart(raw_results, q.query, unit="TJ")
                             optimal_chart_type = intelligent_chart_type_selection(raw_results, q.query, chart_type)
+
+                            # Format numbers in text answer
+                            formatted_lines = []
+                            for r in raw_results:
+                                date_or_cat, val = r[0], convert_decimal_to_float(r[1])
+                                formatted_lines.append(f"- {date_or_cat}: {format_number(val, 'TJ')}")
+                            formatted_answer = "Here’s the requested data:\n\n" + "\n".join(formatted_lines)
+
                             result_payload.update({
-                                "answer": "Here's your data visualization:",
+                                "answer": formatted_answer,
                                 "chartType": optimal_chart_type,
                                 "data": chart_data,
                                 "chartMetadata": chart_metadata
