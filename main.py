@@ -31,7 +31,7 @@ if not OPENAI_API_KEY or not SUPABASE_DB_URL:
 # DB connection
 engine = create_engine(SUPABASE_DB_URL, pool_pre_ping=True)
 
-# Restrict DB access to documented tables/views
+# Restrict DB access to documented tables/views (for the LLM tool use)
 allowed_tables = [
     "energy_balance_long",
     "entities",
@@ -129,8 +129,10 @@ You are EnerBot, an expert Georgian electricity market data analyst with advance
 {DB_SCHEMA_DOC}
 """
 
+# Accept optional user_id for memory without breaking existing callers
 class Question(BaseModel):
     query: str
+    user_id: str | None = None
 
 # ---------- Helpers ----------
 def convert_decimal_to_float(obj):
@@ -229,6 +231,39 @@ def scrub_schema_mentions(text: str) -> str:
     text = re.sub(r'\b(schema|table|column|sql|join)\b', 'data', text, flags=re.IGNORECASE)
     return text
 
+# ---------- Short-memory helpers (last 3 Q/A pairs) ----------
+def get_recent_history(user_id: str, limit_pairs: int = 3):
+    """
+    Pull last `limit_pairs` user+assistant exchanges for this user from chat_history.
+    If table is unavailable or user_id is None, returns [].
+    """
+    if not user_id:
+        return []
+    try:
+        with engine.connect() as conn:
+            rows = conn.execute(
+                text("""
+                SELECT role, content
+                FROM chat_history
+                WHERE user_id = :uid
+                ORDER BY created_at DESC
+                LIMIT :lim
+                """),
+                {"uid": user_id, "lim": limit_pairs * 2}
+            ).fetchall()
+        rows = rows[::-1]  # chronological order
+        return [{"role": r[0], "content": r[1]} for r in rows]
+    except Exception:
+        # If chat_history table is not accessible here, just skip memory
+        return []
+
+def build_memory_context(user_id: str | None, query: str) -> str:
+    history = get_recent_history(user_id, limit_pairs=3) if user_id else []
+    if not history:
+        return query
+    history_text = "\n".join([f"{m['role'].capitalize()}: {m['content']}" for m in history])
+    return f"{history_text}\nUser: {query}\nAssistant:"
+
 # ---------- Core shaping of SQL results → chartable data ----------
 def process_sql_results_for_chart(raw_results, query: str, unit: str = "Value"):
     """
@@ -281,7 +316,7 @@ def process_sql_results_for_chart(raw_results, query: str, unit: str = "Value"):
 
     return chart_data, metadata
 
-# ---------- Analyses ----------
+# ---------- Analyses (rule-based options kept) ----------
 def perform_forecast(chart_data, target="2030-12-01"):
     df = pd.DataFrame(chart_data)
     if "date" not in df or "value" not in df or df.empty:
@@ -500,6 +535,9 @@ def ask(q: Question, x_app_key: str = Header(...)):
             msg = "Do you want the full 2015–2025 trend, or a specific period (e.g., 2020–2024 or last 3 years)?"
             return {"answer": msg, "chartType": None, "data": None, "chartMetadata": None}
 
+        # Build memory-augmented input if user_id provided; fallback to raw query otherwise
+        final_input = build_memory_context(q.user_id, q.query) if q.user_id else q.query
+
         llm = ChatOpenAI(model="gpt-4o", temperature=0, openai_api_key=OPENAI_API_KEY)
         toolkit = SQLDatabaseToolkit(db=db, llm=llm)
         agent = create_sql_agent(
@@ -510,8 +548,8 @@ def ask(q: Question, x_app_key: str = Header(...)):
             system_message=SYSTEM_PROMPT
         )
 
-        # Run agent and request intermediate steps
-        result = agent.invoke({"input": q.query}, return_intermediate_steps=True)
+        # Run agent and request intermediate steps (some runtimes may not return this; guard with .get)
+        result = agent.invoke({"input": final_input}, return_intermediate_steps=True)
         response_text = result.get("output", "")
         steps = result.get("intermediate_steps", [])
 
@@ -519,7 +557,8 @@ def ask(q: Question, x_app_key: str = Header(...)):
             try:
                 last_step = steps[-1]
                 sql_cmd = None
-                if isinstance(last_step, tuple) and "sql_cmd" in last_step[0]:
+                # LangChain tool step formats vary; handle tuple or dict shapes safely
+                if isinstance(last_step, tuple) and isinstance(last_step[0], dict) and "sql_cmd" in last_step[0]:
                     sql_cmd = last_step[0]["sql_cmd"]
                 elif isinstance(last_step, dict) and "sql_cmd" in last_step:
                     sql_cmd = last_step["sql_cmd"]
@@ -531,74 +570,74 @@ def ask(q: Question, x_app_key: str = Header(...)):
                             chart_data, meta = process_sql_results_for_chart(raw, q.query, unit)
                             chart_type_opt = intelligent_chart_type_selection(raw, q.query, chart_type)
 
-                            # ----- Apply requested analysis -----
+                            # ----- Optional rule-based metrics if explicitly requested -----
                             note = ""
                             if analysis_type == "forecast":
                                 f, t = perform_forecast(chart_data)
                                 if f is not None:
-                                    note = f"\n📈 Forecast for {t}: {format_number(f, unit)} (approximate)"
+                                    note += f"\n📈 Forecast for {t}: {format_number(f, unit)} (approximate)"
                             elif analysis_type == "yoy":
                                 c = perform_yoy(chart_data)
                                 if c is not None:
-                                    note = f"\n📊 YoY change: {c}%"
+                                    note += f"\n📊 YoY change: {c}%"
                             elif analysis_type == "mom":
                                 c = perform_mom(chart_data)
                                 if c is not None:
-                                    note = f"\n📊 MoM change: {c}%"
+                                    note += f"\n📊 MoM change: {c}%"
                             elif analysis_type == "cagr":
                                 c = perform_cagr(chart_data)
                                 if c is not None:
-                                    note = f"\n📈 CAGR: {c}%"
+                                    note += f"\n📈 CAGR: {c}%"
                             elif analysis_type == "average":
                                 avg = perform_average(chart_data)
                                 if avg is not None:
-                                    note = f"\n🔢 Average: {format_number(avg, unit)}"
+                                    note += f"\n🔢 Average: {format_number(avg, unit)}"
                             elif analysis_type == "sum":
                                 total = perform_sum(chart_data)
                                 if total is not None:
-                                    note = f"\n🔢 Total: {format_number(total, unit)}"
+                                    note += f"\n🔢 Total: {format_number(total, unit)}"
                             elif analysis_type == "max":
                                 res = perform_max(chart_data)
                                 if res:
                                     val, when = res
-                                    note = f"\n📈 Max: {format_number(val, unit)} on {when}"
+                                    note += f"\n📈 Max: {format_number(val, unit)} on {when}"
                             elif analysis_type == "min":
                                 res = perform_min(chart_data)
                                 if res:
                                     val, when = res
-                                    note = f"\n📉 Min: {format_number(val, unit)} on {when}"
+                                    note += f"\n📉 Min: {format_number(val, unit)} on {when}"
                             elif analysis_type == "correlation":
                                 cor = perform_correlation(raw)
                                 if cor:
-                                    note = f"\n🔗 Correlation analysis:\n{cor}"
+                                    note += f"\n🔗 Correlation analysis:\n{cor}"
                             elif analysis_type == "share":
                                 s = perform_share(chart_data)
                                 if s:
-                                    note = f"\n📊 Shares (% of total): {s}"
+                                    note += f"\n📊 Shares (% of total): {s}"
                             elif analysis_type == "ranking":
                                 r = perform_ranking(chart_data)
                                 if r:
-                                    note = f"\n🏆 Top values: {r}"
+                                    note += f"\n🏆 Top values: {r}"
                             elif analysis_type == "seasonal":
                                 s = perform_seasonal(chart_data)
                                 if s:
-                                    note = f"\n📅 Seasonal pattern (avg by month): {s}"
+                                    note += f"\n📅 Seasonal pattern (avg by month): {s}"
                             elif analysis_type == "anomaly":
                                 a = perform_anomaly(chart_data)
                                 if a:
-                                    note = f"\n⚠️ Anomalies (±2σ): {a}"
+                                    note += f"\n⚠️ Anomalies (±2σ): {a}"
                             elif analysis_type == "ratio":
                                 r = perform_ratio(chart_data)
                                 if r:
-                                    note = f"\n➗ Simple ratio (last/prev): {r}"
+                                    note += f"\n➗ Simple ratio (last/prev): {r}"
                             elif analysis_type == "rolling_avg":
                                 r = perform_rolling_avg(chart_data)
                                 if r:
-                                    note = f"\n📉 Rolling average (3): {r}"
+                                    note += f"\n📉 Rolling average (3): {r}"
                             elif analysis_type == "compare":
                                 comp = perform_comparison(chart_data)
                                 if comp:
-                                    note = (
+                                    note += (
                                         f"\n🔍 Comparison:\n"
                                         f"{comp['group_a']} = {format_number(comp['val_a'], unit)}, "
                                         f"{comp['group_b']} = {format_number(comp['val_b'], unit)} → "
@@ -609,15 +648,29 @@ def ask(q: Question, x_app_key: str = Header(...)):
                                     if comp['ratio'] is not None:
                                         note += f", ratio: {comp['ratio']}"
 
-                            # Build a clean text list of values
-                            lines = [f"- {r[0]}: {format_number(convert_decimal_to_float(r[1]), unit)}" for r in raw]
-                            ans = "Here’s the requested data:\n\n" + "\n".join(lines) + note
+                            # ----- Autonomous analysis: always ask the LLM to explain the data -----
+                            analysis_prompt = f"""
+You are EnerBot. Analyze the following data and answer the user's question.
+User query: {q.query}
+Units: {unit}
+Data (chart_data): {chart_data}
 
-                            # Final scrub against schema leakage (belt & suspenders)
-                            ans = scrub_schema_mentions(ans)
+Write a concise analytical explanation (not raw rows):
+- Identify overall direction (increasing/decreasing/flat) and the approximate percentage change from first to last point.
+- Mention seasonality if relevant (hydro ↑ spring/summer, ↓ winter; thermal often ↑ winter).
+- Call out peaks/lows/anomalies, and offer a one-line takeaway.
+- If the query implies comparison or mix, compare clearly.
+- Keep it grounded strictly in this data. Do NOT mention tables, SQL, schema, or column names.
+"""
+                            analysis_msg = llm.invoke(analysis_prompt)
+                            auto_text = getattr(analysis_msg, "content", str(analysis_msg)) if analysis_msg else ""
+
+                            # Combine autonomous analysis + optional numeric notes (if any explicit analysis requested)
+                            combined = (auto_text.strip() + ("\n" + note if note else "")).strip()
+                            combined = scrub_schema_mentions(combined)
 
                             return {
-                                "answer": ans,
+                                "answer": combined if combined else scrub_schema_mentions(response_text),
                                 "chartType": chart_type_opt if is_chart else None,
                                 "data": chart_data if is_chart else None,
                                 "chartMetadata": meta if is_chart else None
@@ -627,7 +680,7 @@ def ask(q: Question, x_app_key: str = Header(...)):
                 safe_text = scrub_schema_mentions(response_text)
                 return {"answer": safe_text, "chartType": None, "data": None, "chartMetadata": None}
 
-        # Fallback: text only
+        # Fallback: text only (no structured results)
         response_text = scrub_schema_mentions(response_text)
         return {"answer": response_text, "chartType": None, "data": None, "chartMetadata": None}
 
