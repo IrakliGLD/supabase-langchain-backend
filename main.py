@@ -200,17 +200,15 @@ def ask(q: Question, x_app_key: str = Header(...)):
             toolkit=toolkit,
             verbose=True,
             agent_type="openai-tools",
-            system_message=SYSTEM_PROMPT,
-            return_intermediate_steps=True
+            system_message=SYSTEM_PROMPT
         )
 
-        # Run agent
+        # Run agent with intermediate steps
         result = agent.invoke({"input": q.query}, return_intermediate_steps=True)
 
         # Extract safe values
         response_text = result.get("output", "")
-
-steps = result.get("intermediate_steps", [])
+        steps = result.get("intermediate_steps", [])
 
         # Default payload
         result_payload = {
@@ -238,7 +236,7 @@ steps = result.get("intermediate_steps", [])
                             chart_data, chart_metadata = process_sql_results_for_chart(raw_results, q.query, unit="TJ")
                             optimal_chart_type = intelligent_chart_type_selection(raw_results, q.query, chart_type)
 
-                            # Format numbers in text answer
+                            # Format numbers nicely for text output
                             formatted_lines = []
                             for r in raw_results:
                                 date_or_cat, val = r[0], convert_decimal_to_float(r[1])
