@@ -23,6 +23,7 @@ SUPABASE_DB_URL = os.getenv("SUPABASE_DB_URL")
 ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*")
 APP_SECRET_KEY = os.getenv("APP_SECRET_KEY")
 
+
 if not OPENAI_API_KEY or not SUPABASE_DB_URL:
     raise RuntimeError("Missing OPENAI_API_KEY or SUPABASE_DB_URL in environment")
 
