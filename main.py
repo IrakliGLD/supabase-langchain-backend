@@ -1,4 +1,5 @@
-import os 
+import os
+import re
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -15,7 +16,6 @@ import pandas as pd
 
 # Import DB documentation context
 from context import DB_SCHEMA_DOC
-
 
 # Load .env file
 load_dotenv()
@@ -68,12 +68,64 @@ app.add_middleware(
 SYSTEM_PROMPT = f"""
 You are EnerBot, an expert Georgian electricity market data analyst with advanced visualization and lightweight analytics.
 
-Rules:
-- Never output SQL directly to the user.
-- Always rely only on database results. Do not use outside knowledge.
-- Use correct units and label charts clearly.
-- Apply lightweight analytics when asked (trend, YoY/MoM, averages, sums, min/max, correlation, shares, ranking, seasonality, anomalies, ratios, rolling averages, comparisons).
-- For ambiguous queries, ask for clarification.
+=== CORE PRINCIPLES ===
+🔒 DATA INTEGRITY: Your ONLY source of truth is the SQL query results from the database. Never use outside knowledge, assumptions, or estimates.
+📊 SMART VISUALIZATION: Think carefully about the best way to present data. Consider the nature of the data and the user's analytical needs.
+🎯 RELEVANT RESULTS: Focus on what the user actually asked for. Don't provide tangential information.
+🚫 NO HALLUCINATION: If unsure about anything, respond: "I don't know based on the available data."
+
+=== IMPORTANT SECURITY RULES ===
+- NEVER reveal table names, column names, or any database structure to the user.
+- Use the schema documentation only internally to generate correct SQL.
+- If the user asks about database structure or who you are, reply:
+  "I’m an electricity market assistant. I can help analyze and explain energy, price, and trade data."
+- Always answer in plain language, not SQL. Do not include SQL in your responses.
+
+=== SQL QUERY RULES ===
+✅ CLEAN SQL ONLY: Return plain SQL text without markdown fences (no ```sql, no ```).
+✅ SCHEMA COMPLIANCE: Use only documented tables/columns. Double-check names against the schema.
+✅ FLEXIBLE MATCHING: Handle user typos gracefully (e.g., "residencial" → "residential").
+✅ PROPER AGGREGATION: Use SUM/AVG/COUNT appropriately.
+✅ SMART FILTERING: Apply appropriate WHERE clauses for date ranges, sectors, sources.
+✅ LOGICAL JOINS: Only join when schema relationships clearly support it.
+✅ PERFORMANCE AWARE: Use LIMIT for large datasets, especially for charts.
+
+=== DATA PRESENTATION INTELLIGENCE ===
+- Trends over time → Line charts
+- Comparisons between categories → Bar charts
+- Proportional breakdowns → Pie charts
+- Many categories → Prefer bars to avoid overcrowding
+- For time series, ensure ordered dates.
+
+=== TREND & ANALYSIS RULES ===
+- If the user requests a "trend" but does not specify a time period:
+  1) Check the full available dataset.
+  2) Ask for clarification: "Do you want the full 2015–2025 trend, or a specific period?"
+  3) If the user does not clarify, default to analyzing the entire available period.
+- Always mention SEASONALITY when analyzing generation:
+  • Hydropower → higher spring/summer, lower winter.
+  • Thermal → often higher in winter or when hydro is low.
+  • Imports/exports → can vary seasonally.
+- Never analyze just a few rows unless explicitly requested.
+- Prefer monthly/yearly aggregation unless the user asks for daily.
+
+=== RESPONSE FORMATTING ===
+📝 TEXT:
+- Clear, structured summaries.
+- Include context: time periods, sectors, units.
+- Round numbers (e.g., 1,083.9 not 1083.87439).
+- Highlight key insights (trends, peaks, changes).
+
+📈 CHARTS:
+- If charts are requested, return structured data suitable for plotting (time series: date+value; categories: label+value).
+- Keep explanations minimal when charts are requested.
+
+=== ERROR HANDLING ===
+❌ No data found → "I don't have data for that specific request."
+❌ Ambiguous request → Ask for clarification.
+❌ Invalid parameters → Suggest alternatives based on available data.
+
+=== SCHEMA DOCUMENTATION (FOR INTERNAL USE ONLY) ===
 {DB_SCHEMA_DOC}
 """
 
@@ -104,28 +156,27 @@ def format_number(value: float, unit: str = None) -> str:
 def detect_unit(query: str):
     q = query.lower()
     if "price" in q or "tariff" in q:
-        # default local currency
-        if "usd" in q: 
+        if "usd" in q:
             return "USD/MWh"
         return "GEL/MWh"
-    # energy volumes / balances
     if any(word in q for word in ["generation", "consume", "consumption", "energy", "balance", "trade", "import", "export"]):
         return "TJ"
     return "Value"
 
 def is_chart_request(query: str) -> tuple[bool, str]:
-    query_lower = query.lower()
+    q = query.lower()
     patterns = ["chart","plot","graph","visualize","visualization","show as","display as","bar chart","line chart","pie chart"]
-    if not any(p in query_lower for p in patterns):
+    if not any(p in q for p in patterns):
         return False, None
-    if "pie" in query_lower: 
+    if "pie" in q:
         return True, "pie"
-    if any(w in query_lower for w in ["line","trend","over time"]):
+    if any(w in q for w in ["line","trend","over time"]):
         return True, "line"
     return True, "bar"
 
 def detect_analysis_type(query: str):
     q = query.lower()
+    if "trend" in q: return "trend"
     if any(w in q for w in ["forecast","predict","projection","expected","future"]): return "forecast"
     if any(w in q for w in ["yoy","year-over-year","annual change"]): return "yoy"
     if any(w in q for w in ["month-over-month","mom","last month","vs previous month"]): return "mom"
@@ -145,16 +196,38 @@ def detect_analysis_type(query: str):
     return "none"
 
 def intelligent_chart_type_selection(raw_results, query: str, explicit_type: str = None):
-    if explicit_type: 
+    if explicit_type:
         return explicit_type
-    if not raw_results: 
+    if not raw_results:
         return "bar"
     q = query.lower()
-    if any(w in q for w in ["trend","over time","monthly","yearly"]): 
+    if any(w in q for w in ["trend","over time","monthly","yearly"]):
         return "line"
-    if "share" in q or "composition" in q: 
+    if "share" in q or "composition" in q:
         return "pie"
     return "bar"
+
+def needs_trend_clarification(query: str) -> bool:
+    q = query.lower()
+    if "trend" not in q:
+        return False
+    # if explicit years or relative ranges are included, no clarification needed
+    if re.search(r'\b(19|20)\d{2}\b', q):
+        return False
+    if re.search(r'\b(last|past)\s+\d+\s+(year|years|month|months)\b', q):
+        return False
+    if ("from" in q and ("to" in q or "until" in q)) or "-" in q:
+        return False
+    return True
+
+def scrub_schema_mentions(text: str) -> str:
+    """Best-effort scrubber to avoid leaking table/schema terms if LLM attempts it."""
+    if not text:
+        return text
+    for t in allowed_tables:
+        text = re.sub(rf'\b{re.escape(t)}\b', "the database", text, flags=re.IGNORECASE)
+    text = re.sub(r'\b(schema|table|column|sql|join)\b', 'data', text, flags=re.IGNORECASE)
+    return text
 
 # ---------- Core shaping of SQL results → chartable data ----------
 def process_sql_results_for_chart(raw_results, query: str, unit: str = "Value"):
@@ -171,17 +244,13 @@ def process_sql_results_for_chart(raw_results, query: str, unit: str = "Value"):
         "datasetLabel": "Data"
     }
 
-    # Build a DataFrame and try to parse the left column as dates
     df = pd.DataFrame(raw_results, columns=["date_or_cat","value"])
-    # convert decimals to floats
     df["value"] = df["value"].apply(convert_decimal_to_float).astype(float)
 
-    # Detect if user prefers yearly/monthly grouping
     q = query.lower()
     want_year = any(w in q for w in ["year", "annual", "yearly"])
     want_month = any(w in q for w in ["month", "monthly"])
 
-    # Try to parse dates
     is_dt = False
     try:
         df["date_or_cat"] = pd.to_datetime(df["date_or_cat"])
@@ -201,13 +270,11 @@ def process_sql_results_for_chart(raw_results, query: str, unit: str = "Value"):
             chart_data = [{"date": row["month"], "value": round(row["value"], 1)} for _, row in grouped.iterrows()]
             metadata["xAxisTitle"] = "Month"
         else:
-            # default: keep as date
             df = df.sort_values("date_or_cat")
             for _, r in df.iterrows():
                 chart_data.append({"date": str(r["date_or_cat"].date()), "value": round(r["value"], 1)})
             metadata["xAxisTitle"] = "Date"
     else:
-        # treat as categories (e.g., sectors, entities)
         for r in raw_results:
             chart_data.append({"sector": str(r[0]), "value": round(float(convert_decimal_to_float(r[1])), 1)})
         metadata["xAxisTitle"] = "Category"
@@ -299,14 +366,9 @@ def perform_max(chart_data):
     return round(float(row["value"]), 1), row.get("date") or row.get("sector")
 
 def perform_correlation(raw_results):
-    """
-    Expects SQL returned multiple numeric columns.
-    Builds a human-friendly correlation summary if possible.
-    """
     df = pd.DataFrame(raw_results)
     if df.empty:
         return None
-    # try select numeric only
     num = df.select_dtypes(include=[np.number])
     if num.shape[1] < 2:
         return None
@@ -325,18 +387,12 @@ def perform_correlation(raw_results):
     return "\n".join(out) if out else None
 
 def perform_share(chart_data):
-    """
-    Computes percentage share of each row vs total.
-    Suitable when chart_data is categorical (sector/value) or
-    for last time point categories (if time series pre-aggregated by categories).
-    """
     df = pd.DataFrame(chart_data)
     if "value" not in df or df.empty:
         return None
     total = df["value"].sum()
     if total == 0:
         return None
-    # 'date' or 'sector' label field
     label_col = "sector" if "sector" in df.columns else "date"
     return {str(row[label_col]): round(row["value"] / total * 100, 1) for _, row in df.iterrows()}
 
@@ -350,9 +406,6 @@ def perform_ranking(chart_data, n=3):
     return [{label_col: str(r[label_col]), "value": round(float(r["value"]), 1)} for _, r in top.iterrows()]
 
 def perform_seasonal(chart_data):
-    """
-    Average value by calendar month across all years.
-    """
     df = pd.DataFrame(chart_data)
     if "date" not in df or "value" not in df or df.empty:
         return None
@@ -369,14 +422,9 @@ def perform_anomaly(chart_data):
     if sd == 0 or np.isnan(sd):
         return []
     anomalies = df[(df["value"] > m + 2 * sd) | (df["value"] < m - 2 * sd)]
-    # keep simple
     return anomalies.to_dict(orient="records")
 
 def perform_ratio(chart_data):
-    """
-    Very light ratio: last value divided by previous value.
-    For more complex 'X vs Y' ratios, you'd need a multi-series SQL result.
-    """
     df = pd.DataFrame(chart_data)
     if "value" not in df or df.empty or len(df) < 2:
         return None
@@ -396,21 +444,12 @@ def perform_rolling_avg(chart_data, window=3):
     return [{"date": str(r["date"].date()), "value": round(float(r["rolling"]), 1)} for _, r in rolled.iterrows()]
 
 def perform_comparison(chart_data):
-    """
-    Compare two groups (e.g., hydro vs thermal) present in chart_data.
-    If it's time series, tries to compare last two rows; if categorical,
-    compares the first two categories.
-    """
     df = pd.DataFrame(chart_data)
     if df.empty or "value" not in df:
         return None
-
-    # decide label column
     label_col = "sector" if "sector" in df.columns else ("date" if "date" in df.columns else None)
     if label_col is None:
         return None
-
-    # If time series: compare last two time points (not really group compare but helpful)
     if label_col == "date":
         df["date"] = pd.to_datetime(df["date"])
         df = df.sort_values("date")
@@ -418,17 +457,14 @@ def perform_comparison(chart_data):
             return None
         a, b = df.iloc[-1], df.iloc[-2]
     else:
-        # categorical: take top two by value (largest groups)
         df = df.sort_values("value", ascending=False)
         if len(df) < 2:
             return None
         a, b = df.iloc[0], df.iloc[1]
-
     val_a, val_b = float(a["value"]), float(b["value"])
     abs_diff = round(val_a - val_b, 1)
     pct_diff = round((val_a - val_b) / val_b * 100, 1) if val_b != 0 else None
     ratio = round(val_a / val_b, 2) if val_b != 0 else None
-
     return {
         "group_a": str(a[label_col]),
         "group_b": str(b[label_col]),
@@ -458,6 +494,11 @@ def ask(q: Question, x_app_key: str = Header(...)):
         is_chart, chart_type = is_chart_request(q.query)
         analysis_type = detect_analysis_type(q.query)
         unit = detect_unit(q.query)
+
+        # If a trend is requested without any period hint, ask for clarification first.
+        if analysis_type == "trend" and needs_trend_clarification(q.query):
+            msg = "Do you want the full 2015–2025 trend, or a specific period (e.g., 2020–2024 or last 3 years)?"
+            return {"answer": msg, "chartType": None, "data": None, "chartMetadata": None}
 
         llm = ChatOpenAI(model="gpt-4o", temperature=0, openai_api_key=OPENAI_API_KEY)
         toolkit = SQLDatabaseToolkit(db=db, llm=llm)
@@ -568,9 +609,12 @@ def ask(q: Question, x_app_key: str = Header(...)):
                                     if comp['ratio'] is not None:
                                         note += f", ratio: {comp['ratio']}"
 
-                            # Build clean text list of values for transparency
+                            # Build a clean text list of values
                             lines = [f"- {r[0]}: {format_number(convert_decimal_to_float(r[1]), unit)}" for r in raw]
                             ans = "Here’s the requested data:\n\n" + "\n".join(lines) + note
+
+                            # Final scrub against schema leakage (belt & suspenders)
+                            ans = scrub_schema_mentions(ans)
 
                             return {
                                 "answer": ans,
@@ -580,9 +624,11 @@ def ask(q: Question, x_app_key: str = Header(...)):
                             }
             except Exception as e:
                 print("❌ SQL/analysis error:", e)
-                return {"answer": response_text, "chartType": None, "data": None, "chartMetadata": None}
+                safe_text = scrub_schema_mentions(response_text)
+                return {"answer": safe_text, "chartType": None, "data": None, "chartMetadata": None}
 
-        # Fallback: text only (no structured data)
+        # Fallback: text only
+        response_text = scrub_schema_mentions(response_text)
         return {"answer": response_text, "chartType": None, "data": None, "chartMetadata": None}
 
     except Exception as e:
