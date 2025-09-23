@@ -9,8 +9,6 @@ from langchain.agents import create_sql_agent
 from langchain.agents.agent_toolkits import SQLDatabaseToolkit
 from dotenv import load_dotenv
 from decimal import Decimal
-import json
-import re
 from datetime import datetime
 
 # Import DB documentation context
@@ -44,7 +42,6 @@ db = SQLDatabase(engine, include_tables=allowed_tables)
 
 # --- Patch execution to clean accidental markdown fences ---
 def clean_sql(query: str) -> str:
-    """Remove markdown fences if GPT accidentally adds them."""
     return query.replace("```sql", "").replace("```", "").strip()
 
 old_execute = db._execute
@@ -57,7 +54,7 @@ db._execute = cleaned_execute
 # FastAPI app
 app = FastAPI(title="Supabase LangChain Backend")
 
-# CORS settings (open for now)
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[ALLOWED_ORIGINS] if ALLOWED_ORIGINS != "*" else ["*"],
@@ -66,12 +63,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Enhanced system prompt
+# System prompt
 SYSTEM_PROMPT = f"""
 You are EnerBot, an expert Georgian electricity market data analyst with advanced data visualization intelligence.
 
 === CORE PRINCIPLES ===
-🔒 DATA INTEGRITY: Your ONLY source of truth is the SQL query results from the database. Never use outside knowledge.
+🔒 DATA INTEGRITY: Your ONLY source of truth is the SQL query results from the database. 
 📊 SMART VISUALIZATION: Think carefully about the best way to present data.
 🚫 NO HALLUCINATION: If unsure, respond: "I don't know based on the available data."
 
@@ -79,7 +76,6 @@ You are EnerBot, an expert Georgian electricity market data analyst with advance
 ✅ CLEAN SQL ONLY: No markdown fences.
 ✅ SCHEMA COMPLIANCE: Use only documented tables/columns.
 ✅ PROPER AGGREGATION: SUM for totals, AVG for averages, COUNT for quantities.
-✅ LOGICAL JOINS: Only when schema supports it.
 
 === SCHEMA DOCUMENTATION ===
 {DB_SCHEMA_DOC}
@@ -89,7 +85,6 @@ class Question(BaseModel):
     query: str
 
 def convert_decimal_to_float(obj):
-    """Recursively convert Decimal objects to float"""
     if isinstance(obj, Decimal):
         return float(obj)
     elif isinstance(obj, list):
@@ -111,12 +106,11 @@ def is_chart_request(query: str) -> tuple[bool, str]:
     if not is_chart:
         return False, None
     if any(word in query_lower for word in ["pie", "pie chart"]):
-        chart_type = "pie"
+        return True, "pie"
     elif any(word in query_lower for word in ["line", "line chart", "trend", "over time"]):
-        chart_type = "line"
+        return True, "line"
     else:
-        chart_type = "bar"
-    return True, chart_type
+        return True, "bar"
 
 def intelligent_chart_type_selection(raw_results, query: str, explicit_type: str = None):
     if explicit_type and explicit_type != "auto":
@@ -183,33 +177,9 @@ def ask(q: Question, x_app_key: str = Header(...)):
     try:
         is_chart, chart_type = is_chart_request(q.query)
 
-        # Direct SQL test case for hydro generation
-        if is_chart and "hydro" in q.query.lower() and "generation" in q.query.lower():
-            test_sql = """
-            SELECT 
-                DATE_TRUNC('month', period)::date as month,
-                SUM(volume_tj) as generation_mwh
-            FROM energy_balance_long 
-            WHERE entity_name ILIKE '%hydro%' 
-            GROUP BY DATE_TRUNC('month', period)
-            ORDER BY month
-            """
-            with engine.connect() as conn:
-                result = conn.execute(text(test_sql))
-                raw_results = result.fetchall()
-                if raw_results:
-                    chart_data, chart_metadata = process_sql_results_for_chart(raw_results, q.query)
-                    optimal_chart_type = intelligent_chart_type_selection(raw_results, q.query, chart_type)
-                    return {
-                        "answer": "Here's your hydro generation data:",
-                        "chartType": optimal_chart_type,
-                        "data": chart_data,
-                        "chartMetadata": chart_metadata
-                    }
-
-        # Fallback to LangChain SQL Agent
+        # Configure LLM + SQL Agent
         llm = ChatOpenAI(
-            model="gpt-4o",  # stronger model
+            model="gpt-4o",
             temperature=0,
             openai_api_key=OPENAI_API_KEY
         )
@@ -218,18 +188,50 @@ def ask(q: Question, x_app_key: str = Header(...)):
             llm=llm,
             toolkit=toolkit,
             verbose=True,
-            agent_type="openai-tools",  # tool-calling agent for structured queries
+            agent_type="openai-tools",
             system_message=SYSTEM_PROMPT
         )
 
+        # Run agent
         response = agent.run(q.query)
 
-        return {
+        # Default response payload
+        result_payload = {
             "answer": response,
-            "chartType": None,  # SQLAgent doesn’t return structured chart data automatically
+            "chartType": None,
             "data": None,
             "chartMetadata": None
         }
+
+        # If chart requested, try to execute SQL again to get raw results
+        if is_chart:
+            try:
+                # Extract last SQL statement executed by agent
+                with engine.connect() as conn:
+                    # Very naive: assume agent's response includes SQL
+                    # Better: wrap with return_intermediate_steps=True
+                    # For now: scan for SELECT statement
+                    sql_match = None
+                    for line in response.splitlines():
+                        if "SELECT" in line.upper():
+                            sql_match = line
+                            break
+                    if sql_match:
+                        result_proxy = conn.execute(text(clean_sql(sql_match)))
+                        raw_results = result_proxy.fetchall()
+                        if raw_results:
+                            chart_data, chart_metadata = process_sql_results_for_chart(raw_results, q.query)
+                            optimal_chart_type = intelligent_chart_type_selection(raw_results, q.query, chart_type)
+                            result_payload.update({
+                                "answer": "Here's your data visualization:",
+                                "chartType": optimal_chart_type,
+                                "data": chart_data,
+                                "chartMetadata": chart_metadata
+                            })
+            except Exception as e:
+                print(f"❌ Chart processing failed: {e}")
+
+        return result_payload
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
