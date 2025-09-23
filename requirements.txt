@@ -1,8 +1,8 @@
 fastapi
 uvicorn
+langchain-openai
+langchain-community
+langchain-experimental
 sqlalchemy
 psycopg2-binary
-llama-index-core
-llama-index-llms-openai
-llama-index-embeddings-openai
 python-dotenv
