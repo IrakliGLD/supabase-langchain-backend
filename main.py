@@ -16,6 +16,7 @@ import pandas as pd
 # Import DB documentation context
 from context import DB_SCHEMA_DOC
 
+
 # Load .env file
 load_dotenv()
 
