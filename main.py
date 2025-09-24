@@ -18,6 +18,7 @@ from dotenv import load_dotenv
 from decimal import Decimal
 import numpy as np
 import pandas as pd
+import statsmodels.api as sm  # Added for better seasonality decomposition
 
 # Internal schema doc (DO NOT expose)
 from context import DB_SCHEMA_DOC
@@ -80,6 +81,7 @@ You are EnerBot, an autonomous Georgian electricity market analyst.
 - Always analyze instead of listing: trend direction, % change (first→last), peaks/lows, anomalies, and seasonality if the pattern exists.
 - If the user implies a forecast or “if the current trend maintains…”, compute a forward-looking projection from the available data.
 - Always answer in plain language with units when applicable and end with a one-line key insight.
+- For trends, seasonality, or time-based analysis, ALWAYS query the FULL dataset without any LIMIT, sampling, or truncation to ensure accurate and complete calculations. Do NOT use LIMIT unless the user explicitly requests a small sample.
 
 === DATASET SELECTION (based on the internal schema only) ===
 (1) Choose the dataset solely from the schema descriptions in the internal context:
@@ -87,8 +89,8 @@ You are EnerBot, an autonomous Georgian electricity market analyst.
     • Consumption by sector/fuel → sector balance dataset.
     • Prices (deregulated, balancing, guaranteed capacity) → prices dataset.
     • Tariffs → tariffs dataset.
-(2) Do NOT use tiny samples for time-based questions. Avoid small LIMITs (e.g., LIMIT 10) when analyzing multi-year trends. Query the full range unless a sample is explicitly requested.
-(3) If the user references thermal/hydro (or synonyms like HPP/TPP), prefer the technology-based generation dataset for those technologies.
+(2) If the user references thermal/hydro (or synonyms like HPP/TPP), prefer the technology-based generation dataset for those technologies.
+(3) For multi-table queries (e.g., combining prices with generation), use appropriate joins based on common fields like dates or entities, but only if necessary and supported by the schema.
 
 === TERMINOLOGY ===
 The user may use natural or industry terms (e.g., HPP/Hydro power plant → hydro; TPP/Thermal power plant → thermal).
@@ -190,7 +192,7 @@ def build_context(user_id: Optional[str], user_query: str) -> str:
 def clean_sql(sql: str) -> str:
     if not sql:
         return sql
-    sql = re.sub(r"```sql\s*", "", sql, flags=re.IGNORECASE)
+    sql = re.sub(r"```sql
     sql = re.sub(r"```\s*", "", sql)
     sql = re.sub(r"--.*?$", "", sql, flags=re.MULTILINE)
     sql = re.sub(r"/\*.*?\*/", "", sql, flags=re.DOTALL)
@@ -199,12 +201,18 @@ def clean_sql(sql: str) -> str:
         sql = sql[:-1]
     # Strip LIMIT completely to force full-series retrieval for analysis
     sql = re.sub(r"\bLIMIT\s+\d+\b", "", sql, flags=re.IGNORECASE)
+    # Also strip OFFSET or other sampling
+    sql = re.sub(r"\bOFFSET\s+\d+\b", "", sql, flags=re.IGNORECASE)
     return sql.strip()
 
 
 def validate_sql_is_safe(sql: str) -> None:
     up = sql.upper()
     if not up.startswith("SELECT"):
+        raise ValueError("Only SELECT statements are allowed.")
+    # Additional checks: no DDL/DML
+    forbidden = ["INSERT", "UPDATE", "DELETE", "DROP", "CREATE", "ALTER"]
+    if any(f in up for f in forbidden):
         raise ValueError("Only SELECT statements are allowed.")
 
 
@@ -316,11 +324,47 @@ def find_extremes(ts: pd.DataFrame) -> Tuple[Optional[Tuple[datetime, float]], O
     return max_point, min_point
 
 
+def find_anomalies(ts: pd.DataFrame, threshold: float = 3.0) -> List[Tuple[datetime, float]]:
+    """Detect outliers using z-score."""
+    if ts is None or ts.empty or len(ts) < 3:
+        return []
+    mean = ts["value"].mean()
+    std = ts["value"].std()
+    if std == 0:
+        return []
+    z = np.abs((ts["value"] - mean) / std)
+    outliers = ts[z > threshold]
+    return [(pd.to_datetime(row["date"]), float(row["value"])) for _, row in outliers.iterrows()]
+
+
+def compute_seasonality(ts: pd.DataFrame) -> Optional[Dict[str, Any]]:
+    """Use statsmodels to decompose seasonality if data is sufficient."""
+    if ts is None or ts.empty or "date" not in ts or "value" not in ts or len(ts) < 24:
+        # Fallback to simple monthly averages if not enough data for decomposition
+        tmp = ts.copy()
+        tmp["month"] = pd.to_datetime(tmp["date"]).dt.month
+        monthly = tmp.groupby("month")["value"].mean().round(1)
+        if monthly.empty:
+            return None
+        return {"monthly_profile": {int(m): float(v) for m, v in monthly.to_dict().items()}}
+    
+    try:
+        # Assume monthly data, period=12
+        ts = ts.set_index("date").sort_index()
+        ts = ts.asfreq("M", method="pad")  # Resample to monthly if needed
+        decomp = sm.tsa.seasonal_decompose(ts["value"], model="additive", period=12)
+        seasonal = decomp.seasonal.dropna().round(1)
+        return {"seasonal_component": seasonal.to_dict()}
+    except Exception as e:
+        logger.info(f"Seasonality decomposition failed: {e}")
+        # Fallback
+        return compute_monthly_profile(ts.reset_index().rename(columns={"index": "date"}))
+
+
 def compute_monthly_profile(ts: pd.DataFrame) -> Optional[Dict[int, float]]:
-    """Return monthly average profile {1..12: mean} if time series is long enough."""
+    """Fallback monthly average profile {1..12: mean}."""
     if ts is None or ts.empty or "date" not in ts or "value" not in ts:
         return None
-    # Need at least ~18 points to talk about seasonality credibly
     if len(ts) < 18:
         return None
     tmp = ts.copy()
@@ -358,8 +402,8 @@ You are an energy market analyst. Use ONLY the numbers provided below (they come
 Do NOT mention SQL, schema, tables, or columns. Write a clear, concise analysis:
 - Direction & approximate % change from first to last point.
 - Peaks and lows (when and how much).
-- Seasonality: infer only from the monthly profile given (if present). You may note typical domain patterns,
-  e.g., hydro often peaks in spring/summer and thermal in winter, BUT anchor your comments in the provided monthly profile.
+- Anomalies (outliers) if any.
+- Seasonality: infer only from the provided seasonal component or monthly profile. You may note typical domain patterns (e.g., hydro peaks in spring/summer, thermal in winter), BUT anchor your comments strictly in the provided data.
 - If a forecast is implied, include the provided projection result(s) and caveat that it’s a simple trend extrapolation.
 - For multiple series (e.g., hydro vs thermal), compare them succinctly.
 - End with one short takeaway in plain language.
@@ -372,7 +416,7 @@ def llm_analyst_answer(
     unit: Optional[str],
     series_dict: Dict[str, pd.DataFrame],
     computed: Dict[str, Any],
-    monthly_profiles: Dict[str, Optional[Dict[int, float]]]
+    seasonality_info: Dict[str, Optional[Dict[str, Any]]]
 ) -> str:
     # Build compact previews for the model
     lines = []
@@ -381,9 +425,9 @@ def llm_analyst_answer(
             sample = ts.tail(6).copy()
             sample["date"] = pd.to_datetime(sample["date"]).dt.strftime("%Y-%m")
             pairs = [f"{d}:{round(float(v),1)}" for d, v in zip(sample["date"], sample["value"])]
-            mp = monthly_profiles.get(name)
-            mp_str = f" | monthly_profile={mp}" if mp else ""
-            lines.append(f"{name}: " + ", ".join(pairs) + mp_str)
+            si = seasonality_info.get(name)
+            si_str = f" | seasonality={si}" if si else ""
+            lines.append(f"{name}: " + ", ".join(pairs) + si_str)
         else:
             cats = ts.sort_values("value", ascending=False).head(6)
             pairs = [f"{str(l)}:{round(float(v),1)}" for l, v in zip(cats["label"], cats["value"])]
@@ -393,7 +437,7 @@ def llm_analyst_answer(
     prompt = (
         f"User query: {user_query}\n"
         f"Unit: {unit or 'Value'}\n"
-        f"Series preview (last points & monthly profiles if present):\n- " + "\n- ".join(lines) + "\n"
+        f"Series preview (last points & seasonality if present):\n- " + "\n- ".join(lines) + "\n"
         f"Computed stats:\n- " + "\n- ".join(stats) + "\n"
         "Write the answer now."
     )
@@ -414,6 +458,7 @@ def extract_sql_from_steps(steps: List[Any]) -> Optional[str]:
       - action["sql_cmd"]
       - action["tool_input"]["query"]
       - action["tool_input"] as a raw SQL string
+      - action.log or observation containing SQL
     Prefers the *last* sql_db_query or sql_db_query_checker step.
     """
     if not steps:
@@ -421,22 +466,43 @@ def extract_sql_from_steps(steps: List[Any]) -> Optional[str]:
 
     candidate_sql = None
 
-    for step in steps:
+    for step in reversed(steps):  # Start from last to get the final SQL
         try:
-            action = step[0] if isinstance(step, tuple) and step else step
+            if isinstance(step, tuple) and len(step) >= 2:
+                action, observation = step[0], step[1]
+            else:
+                action = step
+                observation = ""
+
             if not isinstance(action, dict):
                 continue
 
             # direct sql_cmd
             if "sql_cmd" in action and isinstance(action["sql_cmd"], str):
                 candidate_sql = action["sql_cmd"]
+                break  # Prefer the last one
 
             # tool_input might hold SQL
             tool_input = action.get("tool_input")
             if isinstance(tool_input, dict) and isinstance(tool_input.get("query"), str):
                 candidate_sql = tool_input["query"]
+                break
             if isinstance(tool_input, str) and tool_input.strip().upper().startswith("SELECT"):
                 candidate_sql = tool_input
+                break
+
+            # Fallback: parse from log or observation
+            log = action.get("log", "")
+            if "SELECT" in log.upper():
+                match = re.search(r"SELECT.*?;", log, re.DOTALL | re.IGNORECASE)
+                if match:
+                    candidate_sql = match.group(0)
+                    break
+            if "SELECT" in observation.upper():
+                match = re.search(r"SELECT.*?;", observation, re.DOTALL | re.IGNORECASE)
+                if match:
+                    candidate_sql = match.group(0)
+                    break
         except Exception:
             continue
 
@@ -475,7 +541,7 @@ def ask(q: Question, x_app_key: str = Header(...)):
             verbose=True,
             agent_type="openai-tools",
             system_message=SYSTEM_PROMPT,
-            max_iterations=6,
+            max_iterations=8,  # Increased for complex queries
             early_stopping_method="generate",
         )
 
@@ -517,9 +583,9 @@ def ask(q: Question, x_app_key: str = Header(...)):
 
         unit = infer_unit_from_query(q.query)
 
-        # 5) Compute analytics per series (trend/extremes/forecast + model-driven seasonality)
+        # 5) Compute analytics per series (trend/extremes/anomalies/seasonality/forecast)
         computed: Dict[str, Any] = {}
-        monthly_profiles: Dict[str, Optional[Dict[int, float]]] = {}
+        seasonality_info: Dict[str, Optional[Dict[str, Any]]] = {}
 
         for name, s in series_dict.items():
             if "date" in s.columns:
@@ -537,15 +603,19 @@ def ask(q: Question, x_app_key: str = Header(...)):
                     computed[f"{name}__peak"] = f"{mx[0].strftime('%Y-%m')}: {round(mx[1],1)}"
                 if mn:
                     computed[f"{name}__low"] = f"{mn[0].strftime('%Y-%m')}: {round(mn[1],1)}"
-                # monthly profile (seasonality input for the LLM)
-                mp = compute_monthly_profile(s)
-                if mp:
-                    monthly_profiles[name] = mp
+                # anomalies
+                anomalies = find_anomalies(s)
+                if anomalies:
+                    computed[f"{name}__anomalies"] = [f"{d.strftime('%Y-%m')}: {round(v,1)}" for d, v in anomalies]
+                # seasonality
+                si = compute_seasonality(s)
+                if si:
+                    seasonality_info[name] = si
                 else:
-                    monthly_profiles[name] = None
+                    seasonality_info[name] = None
                 # forecast if implied
                 if contains_future_intent(q.query):
-                    target = "2030-12-01" if "2030" in q.query else (pd.to_datetime(s["date"]).max() + pd.DateOffset(years=5)).strftime("%Y-%m-%d")
+                    target = "2030-12-01" if "2030" in q.query.lower() else (pd.to_datetime(s["date"]).max() + pd.DateOffset(years=5)).strftime("%Y-%m-%d")
                     pred = forecast_linear(s, target)
                     if pred is not None:
                         computed[f"{name}__forecast_{target}"] = pred
@@ -561,7 +631,7 @@ def ask(q: Question, x_app_key: str = Header(...)):
 
         # 6) LLM analysis pass (final narrative)
         llm_analyst = ChatOpenAI(model="gpt-4o", temperature=0.2, openai_api_key=OPENAI_API_KEY, request_timeout=45)
-        final_text = llm_analyst_answer(llm_analyst, q.query, unit, series_dict, computed, monthly_profiles)
+        final_text = llm_analyst_answer(llm_analyst, q.query, unit, series_dict, computed, seasonality_info)
 
         if not final_text.strip():
             lines = [f"{k}: {v}" for k, v in sorted(computed.items())]
