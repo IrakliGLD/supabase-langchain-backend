@@ -11,9 +11,10 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.pool import QueuePool
 from langchain_openai import ChatOpenAI
 from langchain_community.utilities import SQLDatabase
-from langchain.agents import create_sql_agent
+from langchain.agents import create_sql_agent, AgentExecutor
 from langchain_core.agents import AgentAction
 from langchain.agents.agent_toolkits import SQLDatabaseToolkit
+from langchain_core.tools import Tool
 from dotenv import load_dotenv
 from decimal import Decimal
 import numpy as np
@@ -47,7 +48,6 @@ ALLOWED_TABLES = [
     "trade",
 ]
 
-# Proactive Join Knowledge Graph (for agent guidance, not a code tool)
 DB_JOINS = {
     "energy_balance_long": {"join_on": "date", "related_to": ["price", "trade"]},
     "price": {"join_on": "date", "related_to": ["energy_balance_long"]},
@@ -69,7 +69,7 @@ engine = create_engine(
 db = SQLDatabase(engine, include_tables=ALLOWED_TABLES)
 
 # ---------------- FastAPI ----------------
-app = FastAPI(title="EnerBot Backend", version="5.0-resilient-analyst")
+app = FastAPI(title="EnerBot Backend", version="5.1-resilient-analyst-v2")
 
 app.add_middleware(
     CORSMiddleware,
@@ -87,13 +87,13 @@ You MUST follow this EXACT process step-by-step for EVERY query:
 1. Determine the user's intent: Is it for a simple value, summary statistic, trend analysis, or future forecast?
 2. Identify the required columns and tables based on the user's query and the internal schema.
 3. If the query requires combining data from multiple tables, use the `DB_JOINS` knowledge provided below to find the correct `JOIN` column.
-4. When performing trend analysis, seasonality checks, or forecasts, you MUST query the FULL dataset without any LIMIT or OFFSET. Always use `ORDER BY` clause on date columns. If you are generating a full-series query, you MUST add a comment `--full_series_query` to the end of the SQL to signal your intent.
-5. If the query is for a specific value or a small sample, you may use a `LIMIT` clause.
+4. If the query is for **trend analysis, seasonality checks, or forecasts**, you MUST use the `sql_db_query_full_series` tool. This tool will automatically query the full dataset without any limits.
+5. If the query is for a **specific value or a small sample**, you may use the standard `sql_db_query` tool.
 6. Execute the final query and generate an intermediate response.
 
 === MANDATORY BEHAVIOR ===
 - Use only the numbers you query from the database. No outside sources or guesses.
-- **NEVER** reveal SQL, schema, table names, or column names in your final answer.
+- NEVER reveal SQL, schema, table names, or column names in your final answer.
 - Your final output must be an analysis, not a list of numbers. Include trends, % changes, peaks, lows, and seasonality.
 - End with one short key insight.
 - Answer in plain language with units (TJ, GEL, etc.) when applicable.
@@ -163,7 +163,6 @@ def infer_unit_from_query(query: str) -> Optional[str]:
         return "MW"
     return None
 
-# ---------------- Memory (read-only: last 3 turns) ----------------
 def get_recent_history(user_id: str, limit_pairs: int = 3) -> List[Dict[str, str]]:
     if not user_id:
         return []
@@ -201,10 +200,8 @@ def clean_sql(sql: str) -> str:
     sql = sql.strip()
     if sql.endswith(";"):
         sql = sql[:-1]
-    # Keep LIMIT if it was user-requested, but remove it if it was agent-added for a full-series query.
-    if "--full_series_query" in sql.lower():
-        sql = re.sub(r"\bLIMIT\s+\d+\b", "", sql, flags=re.IGNORECASE)
-        sql = re.sub(r"\bOFFSET\s+\d+\b", "", sql, flags=re.IGNORECASE)
+    sql = re.sub(r"\bLIMIT\s+\d+\b", "", sql, flags=re.IGNORECASE)
+    sql = re.sub(r"\bOFFSET\s+\d+\b", "", sql, flags=re.IGNORECASE)
     return sql.strip()
 
 def validate_sql_is_safe(sql: str) -> None:
@@ -414,7 +411,7 @@ def extract_sql_from_steps(steps: List[Any]) -> Optional[str]:
             if not isinstance(action_dict, dict):
                 continue
             tool = action_dict.get("tool", "")
-            if tool not in ["sql_db_query", "sql_db_query_checker"]:
+            if tool not in ["sql_db_query", "sql_db_query_checker", "sql_db_query_full_series"]:
                 continue
             if "sql_cmd" in action_dict and isinstance(action_dict["sql_cmd"], str):
                 return action_dict["sql_cmd"]
@@ -456,43 +453,83 @@ def ask(q: Question, x_app_key: str = Header(...)):
     try:
         final_input = build_context(q.user_id, q.query)
         llm_agent = ChatOpenAI(model="gpt-4o", temperature=0, openai_api_key=OPENAI_API_KEY, request_timeout=60)
+        
+        # New: Define a custom tool for full-series queries
+        def run_full_series_query(query: str) -> str:
+            cleaned_query = clean_sql(query)
+            validate_sql_is_safe(cleaned_query)
+            try:
+                with engine.connect() as conn:
+                    result = conn.execute(text(cleaned_query)).fetchall()
+                    return str(result)
+            except Exception as e:
+                return f"Error executing query: {e}"
+
+        custom_tools = [
+            Tool(
+                name="sql_db_query_full_series",
+                func=run_full_series_query,
+                description="Use this tool ONLY for trend analysis, seasonality, or forecasting. It will execute a query and retrieve ALL results without a LIMIT clause."
+            )
+        ]
+
         toolkit = SQLDatabaseToolkit(db=db, llm=llm_agent)
+        toolkit_tools = toolkit.get_tools()
+        
+        # Remove the default sql_db_query tool to force the agent to use the new one for analysis
+        toolkit_tools = [t for t in toolkit_tools if t.name != "sql_db_query"]
+        
+        # Merge our custom tool with the default tools (like list_tables and schema)
+        all_tools = toolkit_tools + custom_tools
+
         agent = create_sql_agent(
             llm=llm_agent,
             toolkit=toolkit,
+            tools=all_tools,
             verbose=True,
             agent_type="openai-tools",
             system_message=SYSTEM_PROMPT,
             max_iterations=8,
             early_stopping_method="generate",
         )
+        
         try:
             result = agent.invoke({"input": final_input, "handle_parsing_errors": True}, return_intermediate_steps=True)
         except Exception as e:
             logger.error(f"Agent parsing failed, retrying with raw query only: {e}")
             result = agent.invoke({"input": q.query, "handle_parsing_errors": True}, return_intermediate_steps=True)
+
         output_text = result.get("output", "") or ""
         steps = result.get("intermediate_steps", []) or []
         sql = extract_sql_from_steps(steps)
+        
         if not sql:
             logger.warning(f"No SQL extracted from steps, falling back to agent output: {output_text}")
             ans = scrub_schema_mentions(output_text or "I don't know based on the available data.")
             return APIResponse(answer=ans, execution_time=round(time.time() - start, 2))
-        sql = clean_sql(sql)
-        validate_sql_is_safe(sql)
+        
+        # We still need to run the full query logic since the agent's observation might be truncated
+        # and we need to pass the full dataframe to the analytics functions.
+        clean_sql_query = clean_sql(sql)
+        validate_sql_is_safe(clean_sql_query)
+        
         with engine.connect() as conn:
-            rows = conn.execute(text(sql)).fetchall()
+            rows = conn.execute(text(clean_sql_query)).fetchall()
+        
         if not rows:
             ans = scrub_schema_mentions("I don't have data for that specific request.")
             return APIResponse(answer=ans, execution_time=round(time.time() - start, 2))
+
         df = coerce_dataframe(rows)
         series_dict = extract_series(df)
         if not series_dict:
             ans = scrub_schema_mentions(output_text or "I don't know based on the available data.")
             return APIResponse(answer=ans, execution_time=round(time.time() - start, 2))
+
         unit = infer_unit_from_query(q.query)
         computed: Dict[str, Any] = {}
         seasonality_info: Dict[str, Optional[Dict[str, Any]]] = {}
+
         for name, s in series_dict.items():
             if "date" in s.columns:
                 s = s.dropna()
