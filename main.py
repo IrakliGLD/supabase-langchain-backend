@@ -202,23 +202,20 @@ def ask(q: Question, x_app_key: str = Header(...)):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     try:
-        # RECOMMENDATION: Centralize LLM and Toolkit creation.
+        logger.info("Step 1: Initializing LLM and agent.")
         llm = ChatOpenAI(model="gpt-4o", temperature=0, openai_api_key=OPENAI_API_KEY, request_timeout=60)
         toolkit = SQLDatabaseToolkit(db=db, llm=llm)
         tools = toolkit.get_tools()
 
-        # RECOMMENDATION: Wrap the default query tool to enforce our cleaning logic.
-        # This is more robust than creating a new tool and hoping the agent picks it.
         for tool in tools:
             if tool.name == "sql_db_query":
                 original_func = tool.func
                 def wrapped_query_func(query: str) -> str:
-                    # Apply our sanitizer and validator to EVERY query the agent runs.
                     cleaned_query = clean_sql(query)
                     validate_sql_is_safe(cleaned_query)
                     return original_func(cleaned_query)
                 tool.func = wrapped_query_func
-                tool.description += " NOTE: LIMIT clauses are ignored by the system. The full dataset will be processed."
+                tool.description += " NOTE: LIMIT clauses are ignored by the system."
 
         agent = create_sql_agent(
             llm=llm,
@@ -231,22 +228,31 @@ def ask(q: Question, x_app_key: str = Header(...)):
             early_stopping_method="generate",
         )
 
-        # Run agent to get the SQL
+        logger.info("Step 2: Invoking agent to generate SQL.")
         result = agent.invoke({"input": q.query}, return_intermediate_steps=True)
-        
-        sql = extract_sql_from_steps(result.get("intermediate_steps", []))
+        logger.info("Step 2a: Agent invocation successful.")
 
+        logger.info("Step 3: Extracting SQL from agent steps.")
+        sql = extract_sql_from_steps(result.get("intermediate_steps", []))
+        
         if not sql:
             logger.warning("No SQL extracted, falling back to agent's direct output.")
-            final_answer = scrub_schema_mentions(result.get("output", "I could not determine how to answer that question based on the available data."))
+            final_answer = scrub_schema_mentions(result.get("output", "I could not determine how to answer that question."))
         else:
-            # Use the new, cleaner processing function
+            logger.info(f"Step 3a: SQL extracted successfully: {sql}")
+            logger.info("Step 4: Processing data and running analysis pipeline.")
             final_answer = process_and_analyze_data(sql, q.query, llm)
+            logger.info("Step 4a: Analysis pipeline successful.")
         
         return APIResponse(
             answer=final_answer,
             execution_time=round(time.time() - start_time, 2)
         )
+
+    # ... (rest of the exception handling is the same)
+    except Exception as e:
+        logger.error(f"Processing error in /ask endpoint: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="An internal processing error occurred.")
 
     except SQLAlchemyError as e:
         logger.error(f"DB error: {e}")
