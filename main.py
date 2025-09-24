@@ -4,11 +4,10 @@ import logging
 from datetime import datetime
 from typing import Optional, Dict, Any, List, Tuple
 
-from fastapi import FastAPI, HTTPException, Header, Depends
+from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, validator
 from sqlalchemy import create_engine, text
-from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.pool import QueuePool
 from langchain_openai import ChatOpenAI
 from langchain_community.utilities import SQLDatabase
@@ -59,7 +58,7 @@ engine = create_engine(
 db = SQLDatabase(engine, include_tables=ALLOWED_TABLES)
 
 # ---------------- FastAPI ----------------
-app = FastAPI(title="EnerBot Backend", version="3.0")
+app = FastAPI(title="EnerBot Backend", version="3.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -207,9 +206,23 @@ def ask(q: Question, x_app_key: str = Header(...)):
 
         llm = ChatOpenAI(model="gpt-4o", temperature=0, openai_api_key=OPENAI_API_KEY)
         toolkit = SQLDatabaseToolkit(db=db, llm=llm)
-        agent = create_sql_agent(llm=llm, toolkit=toolkit, system_message=SYSTEM_PROMPT, verbose=True)
+        agent = create_sql_agent(
+            llm=llm,
+            toolkit=toolkit,
+            system_message=SYSTEM_PROMPT,
+            verbose=True,
+            handle_parsing_errors=True   # 👈 tolerate bad LLM outputs
+        )
 
-        result = agent.invoke({"input": final_input}, return_intermediate_steps=True)
+        try:
+            result = agent.invoke({"input": final_input}, return_intermediate_steps=True)
+        except Exception as e:
+            logger.error(f"Agent parsing failed: {e}")
+            return APIResponse(
+                answer="I don't know based on the available data.",
+                execution_time=round(time.time() - start, 2)
+            )
+
         output = result.get("output", "")
         steps = result.get("intermediate_steps", [])
 
@@ -231,7 +244,7 @@ def ask(q: Question, x_app_key: str = Header(...)):
                 ts, is_ts = prepare_timeseries_data(df)
                 if is_ts:
                     trend = analyze_trend(ts)
-                    fc = forecast_linear(ts) if any(k in q.query.lower() for k in ["forecast","predict","2030"]) else None
+                    fc = forecast_linear(ts) if any(k in q.query.lower() for k in ["forecast", "predict", "2030"]) else None
                     analysis = []
                     if trend:
                         direction, pct = trend
@@ -239,10 +252,16 @@ def ask(q: Question, x_app_key: str = Header(...)):
                     if fc:
                         analysis.append(f"Projection for Dec 2030: {fc}.")
                     if analysis:
-                        return APIResponse(answer=scrub_schema_mentions("\n".join(analysis)), execution_time=round(time.time()-start,2))
+                        return APIResponse(
+                            answer=scrub_schema_mentions("\n".join(analysis)),
+                            execution_time=round(time.time()-start,2)
+                        )
 
         return APIResponse(answer=scrub_schema_mentions(output), execution_time=round(time.time()-start,2))
 
     except Exception as e:
         logger.error(f"Ask failed: {e}")
-        raise HTTPException(status_code=500, detail="Processing error")
+        return APIResponse(
+            answer="I encountered an error while processing your request. Please try again.",
+            execution_time=round(time.time() - start, 2)
+        )
