@@ -1,3 +1,4 @@
+```python
 import os
 import re
 import logging
@@ -12,9 +13,8 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.pool import QueuePool
 from langchain_openai import ChatOpenAI
 from langchain_community.utilities import SQLDatabase
-from langchain.agents import create_sql_agent
+from langchain.agents import create_sql_agent, AgentAction
 from langchain.agents.agent_toolkits import SQLDatabaseToolkit
-from langchain.agents.agent_types import AgentAction
 from dotenv import load_dotenv
 from decimal import Decimal
 import numpy as np
@@ -662,3 +662,4 @@ def ask(q: Question, x_app_key: str = Header(...)):
     except Exception as e:
         logger.error(f"Processing error: {e}")
         raise HTTPException(status_code=500, detail="Processing error")
+```
