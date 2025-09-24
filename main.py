@@ -2,7 +2,7 @@ import os
 import re
 import logging
 from datetime import datetime
-from typing import Optional, Dict, Any, List, Tuple, Union
+from typing import Optional, Dict, Any, List, Tuple
 
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
@@ -60,7 +60,7 @@ engine = create_engine(
 db = SQLDatabase(engine, include_tables=ALLOWED_TABLES)
 
 # ---------------- FastAPI ----------------
-app = FastAPI(title="EnerBot Backend", version="4.0")
+app = FastAPI(title="EnerBot Backend", version="4.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -119,20 +119,14 @@ def scrub_schema_mentions(text: str) -> str:
     if not text:
         return text
 
-    # Replace known column tokens with human labels
     for k, v in TECH_TERM_MAP.items():
         text = re.sub(rf"\b{re.escape(k)}\b", v, text, flags=re.IGNORECASE)
 
-    # Replace table names with "the database"
     for t in ALLOWED_TABLES:
         text = re.sub(rf"\b{re.escape(t)}\b", "the database", text, flags=re.IGNORECASE)
 
-    # Replace db-technical words carefully
     text = re.sub(r"\b(schema|table|column|sql|join|primary key|foreign key)\b", "data", text, flags=re.IGNORECASE)
-
-    # Clean repetitive 'the database the database' artifacts
     text = re.sub(r"(the database\s+){2,}", "the database ", text)
-
     return text.strip()
 
 
@@ -142,7 +136,7 @@ def convert_decimal_to_float(obj):
     if isinstance(obj, list):
         return [convert_decimal_to_float(x) for x in obj]
     if isinstance(obj, tuple):
-        return tuple(convert_decimal_to_float(x) for x in obj)
+        return tuple(convert_decimal_to_float(x) for x in obj]
     if isinstance(obj, dict):
         return {k: convert_decimal_to_float(v) for k, v in obj.items()}
     return obj
@@ -198,13 +192,11 @@ DANGEROUS = [
 def clean_sql(sql: str) -> str:
     if not sql:
         return sql
-    # strip markdown fences & comments
     sql = re.sub(r"```sql\s*", "", sql, flags=re.IGNORECASE)
     sql = re.sub(r"```\s*", "", sql)
     sql = re.sub(r"--.*?$", "", sql, flags=re.MULTILINE)
     sql = re.sub(r"/\*.*?\*/", "", sql, flags=re.DOTALL)
     sql = sql.strip()
-    # ensure single statement
     if sql.endswith(";"):
         sql = sql[:-1]
     return sql.strip()
@@ -217,11 +209,9 @@ def validate_sql_is_safe(sql: str) -> None:
     for word in DANGEROUS:
         if re.search(rf"\b{word}\b", up):
             raise ValueError(f"Dangerous SQL operation detected: {word}")
-    # optional: basic guard that at least one allowed table is present in FROM/JOIN
     allowed_pat = r"|".join([re.escape(t) for t in ALLOWED_TABLES])
     if not re.search(rf"\b({allowed_pat})\b", up):
-        # Allow queries against allowed views if your schema has them; otherwise enforce:
-        logger.info("SQL does not reference an allowed table by name; continuing (the agent may select via subquery/view).")
+        logger.info("SQL does not explicitly reference an allowed table; proceeding if it is a view/subquery.")
 
 
 def try_expand_limit_for_timeseries(sql: str, df: pd.DataFrame) -> str:
@@ -230,6 +220,7 @@ def try_expand_limit_for_timeseries(sql: str, df: pd.DataFrame) -> str:
         return sql
     if re.search(r"\bLIMIT\s+\d+\b", sql, flags=re.IGNORECASE):
         sql2 = re.sub(r"\bLIMIT\s+\d+\b", "LIMIT 50000", sql, flags=re.IGNORECASE)
+        logger.info(f"Expanding LIMIT for time series: {sql} -> {sql2}")
         return sql2
     return sql
 
@@ -238,9 +229,7 @@ def try_expand_limit_for_timeseries(sql: str, df: pd.DataFrame) -> str:
 def coerce_dataframe(rows: List[tuple]) -> pd.DataFrame:
     if not rows:
         return pd.DataFrame()
-    # build DataFrame, infer dtypes
     df = pd.DataFrame([list(r) for r in rows])
-    # Convert Decimals
     df = df.applymap(convert_decimal_to_float)
     return df
 
@@ -248,14 +237,9 @@ def coerce_dataframe(rows: List[tuple]) -> pd.DataFrame:
 def detect_timeseries(df: pd.DataFrame) -> bool:
     if df.empty or df.shape[1] < 2:
         return False
-    # If any column is date-like (datetime/date or parseable) and another numeric → treat as timeseries
-    # Heuristics: check if any col can parse to datetime and any other col numeric
     for i in range(df.shape[1]):
-        col = df.iloc[:, i]
-        # try parse
         try:
-            dt = pd.to_datetime(col)
-            # numeric exists?
+            pd.to_datetime(df.iloc[:, i])
             for j in range(df.shape[1]):
                 if j == i:
                     continue
@@ -267,16 +251,8 @@ def detect_timeseries(df: pd.DataFrame) -> bool:
 
 
 def extract_series(df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
-    """
-    Build one or more series:
-    - If two columns: (date/label, value)
-    - If three columns and types look like (date, category, value) → multiple series by category
-    - If more columns: numeric columns collapsed into separate series if share date.
-    Returns dict: {series_name: DataFrame[date,value]} or {label: DataFrame[label,value]} when non-timeseries.
-    """
     out: Dict[str, pd.DataFrame] = {}
 
-    # If we can parse any date-like col, prefer it as time axis
     date_col_idx = None
     for i in range(df.shape[1]):
         try:
@@ -287,11 +263,8 @@ def extract_series(df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
             continue
 
     if date_col_idx is not None:
-        # Time series branch
-        date_series = pd.to_datetime(df.iloc[:, date_col_idx], errors="coerce")
-        # find numeric cols
+        date_col = pd.to_datetime(df.iloc[:, date_col_idx], errors="coerce")
         numeric_idx = [j for j in range(df.shape[1]) if j != date_col_idx and pd.api.types.is_numeric_dtype(df.iloc[:, j])]
-        # category col (optional)
         cat_idx = None
         for j in range(df.shape[1]):
             if j == date_col_idx:
@@ -301,25 +274,21 @@ def extract_series(df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
                 break
 
         if numeric_idx and cat_idx is not None:
-            # likely (date, category, value)
             val_col = numeric_idx[0]
             cats = df.iloc[:, cat_idx].astype(str)
             vals = pd.to_numeric(df.iloc[:, val_col], errors="coerce")
-            tmp = pd.DataFrame({"date": date_series, "cat": cats, "value": vals}).dropna()
+            tmp = pd.DataFrame({"date": date_col, "cat": cats, "value": vals}).dropna()
             for label, g in tmp.groupby("cat"):
-                s = g[["date", "value"]].sort_values("date").reset_index(drop=True)
+                s = g[["date", "value"]].sort_values("date").reset_index(drop_index=True)
                 out[str(label)] = s
         elif numeric_idx:
-            # single numeric col, one series
             val_col = numeric_idx[0]
             vals = pd.to_numeric(df.iloc[:, val_col], errors="coerce")
-            s = pd.DataFrame({"date": date_series, "value": vals}).dropna().sort_values("date").reset_index(drop=True)
+            s = pd.DataFrame({"date": date_col, "value": vals}).dropna().sort_values("date").reset_index(drop=True)
             out["series"] = s
         else:
-            # no numeric col → return empty
             return {}
     else:
-        # Non-time series: expect (label, value)
         if df.shape[1] < 2:
             return {}
         lbl = df.iloc[:, 0].astype(str)
@@ -394,32 +363,24 @@ def llm_analyst_answer(llm: ChatOpenAI,
                        unit: Optional[str],
                        series_dict: Dict[str, pd.DataFrame],
                        computed: Dict[str, Any]) -> str:
-    """
-    Give the LLM a compact, grounded brief: stats + a tiny sample of points.
-    """
-    # Build a compact data summary
-    summary_lines = []
+    lines = []
     for name, ts in series_dict.items():
         if "date" in ts.columns:
-            # include only a few samples to ground the LLM, not the entire timeseries
             sample = ts.tail(6).copy()
             sample["date"] = pd.to_datetime(sample["date"]).dt.strftime("%Y-%m")
             pairs = [f"{d}:{round(float(v),1)}" for d, v in zip(sample["date"], sample["value"])]
-            summary_lines.append(f"{name}: {', '.join(pairs)}")
+            lines.append(f"{name}: {', '.join(pairs)}")
         else:
             cats = ts.sort_values("value", ascending=False).head(6)
             pairs = [f"{str(l)}:{round(float(v),1)}" for l, v in zip(cats["label"], cats["value"])]
-            summary_lines.append(f"{name} (top): {', '.join(pairs)}")
+            lines.append(f"{name} (top): {', '.join(pairs)}")
 
-    computed_txt = []
-    for k, v in computed.items():
-        computed_txt.append(f"{k}: {v}")
-
+    stats = [f"{k}: {v}" for k, v in computed.items()]
     prompt = (
         f"User query: {user_query}\n"
         f"Unit: {unit or 'Value'}\n"
-        f"Series preview:\n- " + "\n- ".join(summary_lines) + "\n"
-        f"Computed stats:\n- " + "\n- ".join(computed_txt) + "\n"
+        f"Series preview:\n- " + "\n- ".join(lines) + "\n"
+        f"Computed stats:\n- " + "\n- ".join(stats) + "\n"
         "Write the answer now."
     )
 
@@ -431,20 +392,54 @@ def llm_analyst_answer(llm: ChatOpenAI,
     return content.strip()
 
 
-# ---------------- Endpoint helpers ----------------
+# ---------------- Helpers to extract SQL ----------------
 def extract_sql_from_steps(steps: List[Any]) -> Optional[str]:
+    """
+    Robustly extract SQL from LangChain agent steps.
+    Supports:
+      - action["sql_cmd"]
+      - action["tool_input"]["query"]
+      - action["tool_input"] as a raw SQL string
+    Prefers the *last* sql_db_query or sql_db_query_checker step.
+    """
     if not steps:
         return None
-    # Steps often come as [(action_dict, observation), ...]
-    for step in reversed(steps):
+
+    candidate_sql = None
+
+    for step in steps:
         try:
-            if isinstance(step, tuple) and isinstance(step[0], dict) and "sql_cmd" in step[0]:
-                return step[0]["sql_cmd"]
-            if isinstance(step, dict) and "sql_cmd" in step:
-                return step["sql_cmd"]
+            # step is often (action_dict, observation)
+            action = step[0] if isinstance(step, tuple) and step else step
+            if not isinstance(action, dict):
+                continue
+
+            tool = action.get("tool") or action.get("name") or ""
+            if not isinstance(tool, str):
+                tool = ""
+
+            # 1) direct
+            if "sql_cmd" in action and isinstance(action["sql_cmd"], str):
+                candidate_sql = action["sql_cmd"]
+
+            # 2) tool_input could be dict with 'query'
+            tool_input = action.get("tool_input")
+            if isinstance(tool_input, dict) and isinstance(tool_input.get("query"), str):
+                candidate_sql = tool_input["query"]
+
+            # 3) tool_input could be the raw SQL string
+            if isinstance(tool_input, str) and tool_input.strip().upper().startswith("SELECT"):
+                candidate_sql = tool_input
+
+            # prefer sql_db_query / checker
+            if tool in ("sql_db_query", "sql_db_query_checker"):
+                # if we already captured a SQL above in this step, keep it
+                pass
+
         except Exception:
             continue
-    return None
+
+    return candidate_sql
 
 
 def contains_future_intent(q: str) -> bool:
@@ -472,7 +467,7 @@ def ask(q: Question, x_app_key: str = Header(...)):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     try:
-        # 1) Build memory-augmented context for better intent inference
+        # 1) Build memory-augmented context
         final_input = build_context(q.user_id, q.query)
 
         # 2) Create SQL agent (generation only)
@@ -493,7 +488,6 @@ def ask(q: Question, x_app_key: str = Header(...)):
             result = agent.invoke({"input": final_input, "handle_parsing_errors": True}, return_intermediate_steps=True)
         except Exception as e:
             logger.error(f"Agent parsing failed: {e}")
-            # Retry once without history
             result = agent.invoke({"input": q.query, "handle_parsing_errors": True}, return_intermediate_steps=True)
 
         output_text = result.get("output", "") or ""
@@ -502,7 +496,6 @@ def ask(q: Question, x_app_key: str = Header(...)):
         # 4) Extract SQL and execute safely
         sql = extract_sql_from_steps(steps)
         if not sql:
-            # No SQL found → return LLM text (scrubbed)
             ans = scrub_schema_mentions(output_text or "I don't know based on the available data.")
             return APIResponse(answer=ans, execution_time=round(time.time() - start, 2))
 
@@ -518,17 +511,15 @@ def ask(q: Question, x_app_key: str = Header(...)):
 
         df = coerce_dataframe(rows)
 
-        # If we got very few rows and it looks like time series, try expanding LIMIT
+        # If few rows & looks like a time series → expand LIMIT aggressively
         if detect_timeseries(df) and df.shape[0] < 24:
             expanded_sql = try_expand_limit_for_timeseries(sql, df)
             if expanded_sql != sql:
                 with engine.connect() as conn:
                     rows2 = conn.execute(text(expanded_sql)).fetchall()
-                if rows2:
-                    df2 = coerce_dataframe(rows2)
-                    if df2.shape[0] > df.shape[0]:
-                        df = df2
-                        sql = expanded_sql
+                if rows2 and len(rows2) > len(rows):
+                    df = coerce_dataframe(rows2)
+                    sql = expanded_sql
 
         # 5) Build one or more series
         series_dict = extract_series(df)
@@ -538,9 +529,8 @@ def ask(q: Question, x_app_key: str = Header(...)):
 
         unit = infer_unit_from_query(q.query)
 
-        # 6) Compute numeric stats per series
+        # 6) Compute stats
         computed: Dict[str, Any] = {}
-        # Per-series analytics
         for name, s in series_dict.items():
             if "date" in s.columns:
                 s = s.dropna()
@@ -558,16 +548,13 @@ def ask(q: Question, x_app_key: str = Header(...)):
                 seas = analyze_seasonality(s)
                 if seas:
                     computed[f"{name}__seasonality_hint"] = "seasonality visible"
-                # Forecast if implied
                 if contains_future_intent(q.query):
-                    # pick "2030-12-01" as canonical endpoint if "2030" appears, else use +5y
                     target = "2030-12-01" if "2030" in q.query else (pd.to_datetime(s["date"]).max() + pd.DateOffset(years=5)).strftime("%Y-%m-%d")
                     pred = forecast_linear(s, target)
                     if pred is not None:
                         computed[f"{name}__forecast_{target}"] = pred
-                series_dict[name] = s  # store back (cleaned)
+                series_dict[name] = s
             else:
-                # categorical: total & top
                 total = float(s["value"].sum())
                 computed[f"{name}__total"] = round(total, 1)
                 if not s.empty:
@@ -575,16 +562,12 @@ def ask(q: Question, x_app_key: str = Header(...)):
                     share = (float(top_row["value"]) / total * 100) if total > 0 else 0
                     computed[f"{name}__top"] = f"{str(top_row['label'])}: {round(float(top_row['value']),1)} ({share:.1f}% share)"
 
-        # 7) LLM analysis pass (like me 😄): interpret & write
+        # 7) LLM analysis pass (final narrative)
         llm_analyst = ChatOpenAI(model="gpt-4o", temperature=0.2, openai_api_key=OPENAI_API_KEY, request_timeout=45)
         final_text = llm_analyst_answer(llm_analyst, q.query, unit, series_dict, computed)
 
-        # Fallback if somehow empty
         if not final_text.strip():
-            # Build deterministic numeric summary
-            lines = []
-            for k in sorted(computed.keys()):
-                lines.append(f"{k}: {computed[k]}")
+            lines = [f"{k}: {v}" for k, v in sorted(computed.items())]
             final_text = "Here is a numeric summary based on the available data:\n" + "\n".join(lines)
 
         final_text = scrub_schema_mentions(final_text)
