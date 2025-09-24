@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: enerbot
+    env: python
+    plan: free
+    buildCommand: pip install --upgrade pip && pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port 10000
+    envVars:
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: SUPABASE_DB_URL
+        sync: false
+      - key: APP_SECRET_KEY
+        sync: false
+      - key: ALLOWED_ORIGINS
+        value: "*"
