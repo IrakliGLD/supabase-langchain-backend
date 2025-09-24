@@ -79,7 +79,7 @@ You are EnerBot, an autonomous Georgian electricity market analyst.
 - Use only the numbers you query from the database. No outside sources or guesses.
 - NEVER reveal SQL, schema, table names, or column names in your final answer.
 - Always analyze instead of listing: trend direction, % change (first→last), peaks/lows, anomalies, and seasonality if the pattern exists.
-- If the user implies a forecast or “if the current trend maintains…”, compute a forward-looking projection from the available data.
+- If the user implies a forecast or "if the current trend maintains…", compute a forward-looking projection from the available data.
 - Always answer in plain language with units when applicable and end with a one-line key insight.
 - For trends, seasonality, or time-based analysis, ALWAYS query the FULL dataset without any LIMIT, sampling, or truncation to ensure accurate and complete calculations. Do NOT use LIMIT unless the user explicitly requests a small sample.
 
@@ -141,7 +141,7 @@ def convert_decimal_to_float(obj):
     if isinstance(obj, list):
         return [convert_decimal_to_float(x) for x in obj]
     if isinstance(obj, tuple):
-        return tuple(convert_decimal_to_float(x) for x in obj]
+        return tuple(convert_decimal_to_float(x) for x in obj)
     if isinstance(obj, dict):
         return {k: convert_decimal_to_float(v) for k, v in obj.items()}
     return obj
@@ -192,7 +192,7 @@ def build_context(user_id: Optional[str], user_query: str) -> str:
 def clean_sql(sql: str) -> str:
     if not sql:
         return sql
-    # Combine removal of ```sql and ``` delimiters, handle optional whitespace
+    # Combine removal of ```sql
     sql = re.sub(r"```(?:sql)?\s*|\s*```", "", sql, flags=re.IGNORECASE)
     # Remove SQL comments
     sql = re.sub(r"--.*?$", "", sql, flags=re.MULTILINE)
@@ -221,7 +221,7 @@ def coerce_dataframe(rows: List[tuple]) -> pd.DataFrame:
     if not rows:
         return pd.DataFrame()
     df = pd.DataFrame([list(r) for r in rows])
-    df = df.apply(convert_decimal_to_float)
+    df = df.applymap(convert_decimal_to_float)
     return df
 
 
@@ -404,7 +404,7 @@ Do NOT mention SQL, schema, tables, or columns. Write a clear, concise analysis:
 - Peaks and lows (when and how much).
 - Anomalies (outliers) if any.
 - Seasonality: infer only from the provided seasonal component or monthly profile. You may note typical domain patterns (e.g., hydro peaks in spring/summer, thermal in winter), BUT anchor your comments strictly in the provided data.
-- If a forecast is implied, include the provided projection result(s) and caveat that it’s a simple trend extrapolation.
+- If a forecast is implied, include the provided projection result(s) and caveat that it's a simple trend extrapolation.
 - For multiple series (e.g., hydro vs thermal), compare them succinctly.
 - End with one short takeaway in plain language.
 Avoid jargon. Keep it grounded in the data below.
