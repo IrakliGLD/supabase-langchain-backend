@@ -18,7 +18,7 @@ from dotenv import load_dotenv
 from decimal import Decimal
 import numpy as np
 import pandas as pd
-import statsmodels.api as sm  # Added for better seasonality decomposition
+import statsmodels.api as sm
 
 # Internal schema doc (DO NOT expose)
 from context import DB_SCHEMA_DOC
@@ -141,7 +141,7 @@ def convert_decimal_to_float(obj):
     if isinstance(obj, list):
         return [convert_decimal_to_float(x) for x in obj]
     if isinstance(obj, tuple):
-        return tuple(convert_decimal_to_float(x) for x in obj)
+        return tuple(convert_decimal_to_float(x) for x in obj]
     if isinstance(obj, dict):
         return {k: convert_decimal_to_float(v) for k, v in obj.items()}
     return obj
@@ -192,16 +192,16 @@ def build_context(user_id: Optional[str], user_query: str) -> str:
 def clean_sql(sql: str) -> str:
     if not sql:
         return sql
-    sql = re.sub(r"```sql
-    sql = re.sub(r"```\s*", "", sql)
+    # Combine removal of ```sql and ``` delimiters, handle optional whitespace
+    sql = re.sub(r"```(?:sql)?\s*|\s*```", "", sql, flags=re.IGNORECASE)
+    # Remove SQL comments
     sql = re.sub(r"--.*?$", "", sql, flags=re.MULTILINE)
     sql = re.sub(r"/\*.*?\*/", "", sql, flags=re.DOTALL)
     sql = sql.strip()
     if sql.endswith(";"):
         sql = sql[:-1]
-    # Strip LIMIT completely to force full-series retrieval for analysis
+    # Strip LIMIT and OFFSET to force full-series retrieval
     sql = re.sub(r"\bLIMIT\s+\d+\b", "", sql, flags=re.IGNORECASE)
-    # Also strip OFFSET or other sampling
     sql = re.sub(r"\bOFFSET\s+\d+\b", "", sql, flags=re.IGNORECASE)
     return sql.strip()
 
@@ -221,7 +221,7 @@ def coerce_dataframe(rows: List[tuple]) -> pd.DataFrame:
     if not rows:
         return pd.DataFrame()
     df = pd.DataFrame([list(r) for r in rows])
-    df = df.applymap(convert_decimal_to_float)
+    df = df.apply(convert_decimal_to_float)
     return df
 
 
@@ -541,7 +541,7 @@ def ask(q: Question, x_app_key: str = Header(...)):
             verbose=True,
             agent_type="openai-tools",
             system_message=SYSTEM_PROMPT,
-            max_iterations=8,  # Increased for complex queries
+            max_iterations=8,
             early_stopping_method="generate",
         )
 
