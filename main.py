@@ -3,7 +3,6 @@ import re
 import logging
 from datetime import datetime
 from typing import Optional, Dict, Any, List, Tuple
-
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, validator
@@ -20,8 +19,7 @@ from decimal import Decimal
 import numpy as np
 import pandas as pd
 import statsmodels.api as sm
-
-# Internal schema doc (DO NOT expose)
+from statsmodels.tsa.arima.model import ARIMA
 from context import DB_SCHEMA_DOC
 
 # ---------------- Logging ----------------
@@ -38,7 +36,7 @@ ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*")
 if not OPENAI_API_KEY or not SUPABASE_DB_URL or not APP_SECRET_KEY:
     raise RuntimeError("Missing OPENAI_API_KEY, SUPABASE_DB_URL, or APP_SECRET_KEY")
 
-# ---------------- Database ----------------
+# ---------------- Database & Join Knowledge Graph ----------------
 ALLOWED_TABLES = [
     "energy_balance_long",
     "entities",
@@ -49,6 +47,17 @@ ALLOWED_TABLES = [
     "trade",
 ]
 
+# Proactive Join Knowledge Graph (for agent guidance, not a code tool)
+DB_JOINS = {
+    "energy_balance_long": {"join_on": "date", "related_to": ["price", "trade"]},
+    "price": {"join_on": "date", "related_to": ["energy_balance_long"]},
+    "trade": {"join_on": "date", "related_to": ["energy_balance_long"]},
+    "tech_quantity": {"join_on": "date", "related_to": []},
+    "entities": {"join_on": "id", "related_to": []},
+    "monthly_cpi": {"join_on": "date", "related_to": []},
+    "tariff_gen": {"join_on": "date", "related_to": []},
+}
+
 engine = create_engine(
     SUPABASE_DB_URL,
     poolclass=QueuePool,
@@ -57,12 +66,10 @@ engine = create_engine(
     pool_pre_ping=True,
     pool_recycle=3600,
 )
-
-# LangChain DB wrapper limited to allowed tables
 db = SQLDatabase(engine, include_tables=ALLOWED_TABLES)
 
 # ---------------- FastAPI ----------------
-app = FastAPI(title="EnerBot Backend", version="4.3-seasonal-ml")
+app = FastAPI(title="EnerBot Backend", version="5.0-resilient-analyst")
 
 app.add_middleware(
     CORSMiddleware,
@@ -76,58 +83,36 @@ app.add_middleware(
 SYSTEM_PROMPT = f"""
 You are EnerBot, an autonomous Georgian electricity market analyst.
 
-=== STRUCTURED REASONING PROCESS ===
-You MUST follow this EXACT process step-by-step for EVERY query. Reason in <thinking> tags before your final answer, showing each step.
-
-1) Determine what the user wants:
-   - 1a. Simple numbers or direct values from the database.
-   - 1b. Summary statistics (e.g., average, sum, max, min).
-   - 1c. Advanced analysis (e.g., correlation, trend analysis).
-   - 1d. Future predictions (e.g., forecast price after 5 years).
-   If ambiguous, infer conservatively.
-
-2) Identify which variables/columns to use based on the query.
-
-3) Determine the period: If not specified, use ALL available data points. If ambiguous, default to full dataset.
-
-4) Choose the best tool/technique: For predictions (1d), use ARIMA or linear regression; for trends (1c), compute over full series; for stats (1b), aggregate accordingly. If correlation, use Pearson or similar.
-
-5) Execute: Query the full relevant data (NO LIMIT unless specified), analyze, and respond.
-
-Example:
-Query: "What was the trend of hydro generation 2015-2025?"
-<thinking>
-1) User wants advanced analysis (1c: trend).
-2) Variables: hydro quantity_tech.
-3) Period: 2015-2025 (full data in that range).
-4) Tool: Trend calculation over full series.
-5) Execute: Query all hydro data 2015-2025, compute trend.
-</thinking>
-Final answer...
+You MUST follow this EXACT process step-by-step for EVERY query:
+1. Determine the user's intent: Is it for a simple value, summary statistic, trend analysis, or future forecast?
+2. Identify the required columns and tables based on the user's query and the internal schema.
+3. If the query requires combining data from multiple tables, use the `DB_JOINS` knowledge provided below to find the correct `JOIN` column.
+4. When performing trend analysis, seasonality checks, or forecasts, you MUST query the FULL dataset without any LIMIT or OFFSET. Always use `ORDER BY` clause on date columns. If you are generating a full-series query, you MUST add a comment `--full_series_query` to the end of the SQL to signal your intent.
+5. If the query is for a specific value or a small sample, you may use a `LIMIT` clause.
+6. Execute the final query and generate an intermediate response.
 
 === MANDATORY BEHAVIOR ===
 - Use only the numbers you query from the database. No outside sources or guesses.
-- NEVER reveal SQL, schema, table names, or column names in your final answer.
-- Always analyze instead of listing: trend direction, % change (first→last), peaks/lows, anomalies, and seasonality if the pattern exists.
-- If the user implies a forecast or “if the current trend maintains…”, compute a forward-looking projection from the available data.
-- Always answer in plain language with units when applicable and end with a one-line key insight.
-- For trends, seasonality, or time-based analysis, ALWAYS query the FULL dataset without any LIMIT, sampling, or truncation to ensure accurate and complete calculations. Do NOT use LIMIT unless the user explicitly requests a small sample.
+- **NEVER** reveal SQL, schema, table names, or column names in your final answer.
+- Your final output must be an analysis, not a list of numbers. Include trends, % changes, peaks, lows, and seasonality.
+- End with one short key insight.
+- Answer in plain language with units (TJ, GEL, etc.) when applicable.
 
-=== DATASET SELECTION (based on the internal schema only) ===
-(1) Choose the dataset solely from the schema descriptions in the internal context:
-    • Generation by technology (hydro, thermal, wind, solar, etc.) → technology time-series dataset.
-    • Consumption by sector/fuel → sector balance dataset.
-    • Prices (deregulated, balancing, guaranteed capacity) → prices dataset.
-    • Tariffs → tariffs dataset.
-(2) If the user references thermal/hydro (or synonyms like HPP/TPP), prefer the technology-based generation dataset for those technologies.
-(3) For multi-table queries (e.g., combining prices with generation), use appropriate joins based on common fields like dates or entities, but only if necessary and supported by the schema.
+=== DATASET SELECTION & JOINS ===
+(1) Generation by technology (hydro, thermal, wind, solar) → `tech_quantity`
+(2) Consumption by sector/fuel → `energy_balance_long`
+(3) Prices → `price`
+(4) Trade (imports, exports) → `trade`
+(5) To join these tables, use the `date` column. The `DB_JOINS` dictionary below confirms these relationships.
 
 === TERMINOLOGY ===
-The user may use natural or industry terms (e.g., HPP/Hydro power plant → hydro; TPP/Thermal power plant → thermal).
-Interpret terms naturally using the schema documentation and select the correct dataset without asking for confirmation.
+The user may use natural or industry terms (e.g., HPP/Hydro power plant → hydro; TPP/Thermal power plant → thermal). Interpret terms naturally using the schema documentation and select the correct dataset without asking for confirmation.
 
 === INTERNAL SCHEMA (hidden from user) ===
 {DB_SCHEMA_DOC}
+
+=== DB JOIN KNOWLEDGE ===
+DB_JOINS = {DB_JOINS}
 """
 
 # ---------------- Models ----------------
@@ -141,28 +126,20 @@ class Question(BaseModel):
             raise ValueError("Query cannot be empty")
         return v.strip()
 
-
 class APIResponse(BaseModel):
     answer: str
     execution_time: Optional[float] = None
 
-
 # ---------------- Scrubber (no schema leakage) ----------------
 def scrub_schema_mentions(text: str) -> str:
-    """Remove table/schema/SQL jargon from final output."""
     if not text:
         return text
-    # Replace allowed table names with neutral phrase
     for t in ALLOWED_TABLES:
         text = re.sub(rf"\b{re.escape(t)}\b", "the database", text, flags=re.IGNORECASE)
-    # Replace database jargon
     text = re.sub(r"\b(schema|table|column|sql|join|primary key|foreign key|view|constraint)\b", "data", text, flags=re.IGNORECASE)
-    # Clean repeated phrase
     text = re.sub(r"(the database\s+){2,}", "the database ", text)
-    # Remove stray backticks
     text = text.replace("```", "").strip()
     return text
-
 
 # ---------------- Helpers ----------------
 def convert_decimal_to_float(obj):
@@ -176,7 +153,6 @@ def convert_decimal_to_float(obj):
         return {k: convert_decimal_to_float(v) for k, v in obj.items()}
     return obj
 
-
 def infer_unit_from_query(query: str) -> Optional[str]:
     q = query.lower()
     if any(w in q for w in ["price", "tariff", "cost"]):
@@ -186,7 +162,6 @@ def infer_unit_from_query(query: str) -> Optional[str]:
     if any(w in q for w in ["capacity", "power"]):
         return "MW"
     return None
-
 
 # ---------------- Memory (read-only: last 3 turns) ----------------
 def get_recent_history(user_id: str, limit_pairs: int = 3) -> List[Dict[str, str]]:
@@ -209,7 +184,6 @@ def get_recent_history(user_id: str, limit_pairs: int = 3) -> List[Dict[str, str
         logger.info(f"chat_history not available or failed to read: {e}")
         return []
 
-
 def build_context(user_id: Optional[str], user_query: str) -> str:
     history = get_recent_history(user_id, 3) if user_id else []
     if not history:
@@ -217,34 +191,29 @@ def build_context(user_id: Optional[str], user_query: str) -> str:
     h = "\n".join([f"{m['role'].capitalize()}: {m['content']}" for m in history])
     return f"{h}\nUser: {user_query}\nAssistant:"
 
-
 # ---------------- SQL Sanitizer ----------------
 def clean_sql(sql: str) -> str:
     if not sql:
         return sql
-    # Combine removal of ```sql
     sql = re.sub(r"```(?:sql)?\s*|\s*```", "", sql, flags=re.IGNORECASE)
-    # Remove SQL comments
     sql = re.sub(r"--.*?$", "", sql, flags=re.MULTILINE)
     sql = re.sub(r"/\*.*?\*/", "", sql, flags=re.DOTALL)
     sql = sql.strip()
     if sql.endswith(";"):
         sql = sql[:-1]
-    # Strip LIMIT and OFFSET to force full-series retrieval
-    sql = re.sub(r"\bLIMIT\s+\d+\b", "", sql, flags=re.IGNORECASE)
-    sql = re.sub(r"\bOFFSET\s+\d+\b", "", sql, flags=re.IGNORECASE)
+    # Keep LIMIT if it was user-requested, but remove it if it was agent-added for a full-series query.
+    if "--full_series_query" in sql.lower():
+        sql = re.sub(r"\bLIMIT\s+\d+\b", "", sql, flags=re.IGNORECASE)
+        sql = re.sub(r"\bOFFSET\s+\d+\b", "", sql, flags=re.IGNORECASE)
     return sql.strip()
-
 
 def validate_sql_is_safe(sql: str) -> None:
     up = sql.upper()
     if not up.startswith("SELECT"):
         raise ValueError("Only SELECT statements are allowed.")
-    # Additional checks: no DDL/DML
     forbidden = ["INSERT", "UPDATE", "DELETE", "DROP", "CREATE", "ALTER"]
     if any(f in up for f in forbidden):
         raise ValueError("Only SELECT statements are allowed.")
-
 
 # ---------------- Data shaping ----------------
 def coerce_dataframe(rows: List[tuple]) -> pd.DataFrame:
@@ -253,7 +222,6 @@ def coerce_dataframe(rows: List[tuple]) -> pd.DataFrame:
     df = pd.DataFrame([list(r) for r in rows])
     df = df.map(convert_decimal_to_float)
     return df
-
 
 def detect_timeseries(df: pd.DataFrame) -> bool:
     if df.empty or df.shape[1] < 2:
@@ -270,18 +238,10 @@ def detect_timeseries(df: pd.DataFrame) -> bool:
             continue
     return False
 
-
 def extract_series(df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
-    """
-    Return dict of named series.
-    If a categorical column exists alongside date+value, split by category.
-    """
     out: Dict[str, pd.DataFrame] = {}
-
     if df.empty:
         return out
-
-    # Find a datetime-like column
     date_col_idx = None
     for i in range(df.shape[1]):
         try:
@@ -290,14 +250,9 @@ def extract_series(df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
             break
         except Exception:
             continue
-
     if date_col_idx is not None:
         date_col = pd.to_datetime(df.iloc[:, date_col_idx], errors="coerce")
-
-        # Candidate numeric cols
         numeric_idx = [j for j in range(df.shape[1]) if j != date_col_idx and pd.api.types.is_numeric_dtype(df.iloc[:, j])]
-
-        # Candidate category col (first non-numeric, non-date)
         cat_idx = None
         for j in range(df.shape[1]):
             if j == date_col_idx:
@@ -305,7 +260,6 @@ def extract_series(df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
             if not pd.api.types.is_numeric_dtype(df.iloc[:, j]):
                 cat_idx = j
                 break
-
         if numeric_idx and cat_idx is not None:
             val_col = numeric_idx[0]
             cats = df.iloc[:, cat_idx].astype(str)
@@ -322,16 +276,13 @@ def extract_series(df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
         else:
             return {}
     else:
-        # Fallback: categories + values (no date)
         if df.shape[1] < 2:
             return {}
         lbl = df.iloc[:, 0].astype(str)
         vals = pd.to_numeric(df.iloc[:, 1], errors="coerce")
         s = pd.DataFrame({"label": lbl, "value": vals}).dropna().reset_index(drop=True)
         out["categories"] = s
-
     return out
-
 
 # ---------------- Numeric analytics (model-driven seasonality support) ----------------
 def analyze_trend(ts: pd.DataFrame) -> Optional[Tuple[str, Optional[float]]]:
@@ -343,7 +294,6 @@ def analyze_trend(ts: pd.DataFrame) -> Optional[Tuple[str, Optional[float]]]:
     pct = round(((last - first) / first) * 100, 1) if first != 0 else None
     return direction, pct
 
-
 def find_extremes(ts: pd.DataFrame) -> Tuple[Optional[Tuple[datetime, float]], Optional[Tuple[datetime, float]]]:
     if ts is None or ts.empty:
         return None, None
@@ -353,9 +303,7 @@ def find_extremes(ts: pd.DataFrame) -> Tuple[Optional[Tuple[datetime, float]], O
     min_point = (pd.to_datetime(ts.loc[i_min, "date"]), float(ts.loc[i_min, "value"]))
     return max_point, min_point
 
-
 def find_anomalies(ts: pd.DataFrame, threshold: float = 3.0) -> List[Tuple[datetime, float]]:
-    """Detect outliers using z-score."""
     if ts is None or ts.empty or len(ts) < 3:
         return []
     mean = ts["value"].mean()
@@ -366,65 +314,40 @@ def find_anomalies(ts: pd.DataFrame, threshold: float = 3.0) -> List[Tuple[datet
     outliers = ts[z > threshold]
     return [(pd.to_datetime(row["date"]), float(row["value"])) for _, row in outliers.iterrows()]
 
-
 def compute_seasonality(ts: pd.DataFrame) -> Optional[Dict[str, Any]]:
-    """Use statsmodels to decompose seasonality if data is sufficient."""
     if ts is None or ts.empty or "date" not in ts or "value" not in ts or len(ts) < 24:
-        # Fallback to simple monthly averages if not enough data for decomposition
         tmp = ts.copy()
         tmp["month"] = pd.to_datetime(tmp["date"]).dt.month
         monthly = tmp.groupby("month")["value"].mean().round(1)
         if monthly.empty:
             return None
         return {"monthly_profile": {int(m): float(v) for m, v in monthly.to_dict().items()}}
-    
     try:
-        # Assume monthly data, period=12
         ts_copy = ts.set_index("date").sort_index()
-        ts_copy = ts_copy.asfreq("M", method="ffill")  # Use ffill instead of pad (deprecated)
+        ts_copy = ts_copy.asfreq("M", method="ffill")
         decomp = sm.tsa.seasonal_decompose(ts_copy["value"], model="additive", period=12)
         seasonal = decomp.seasonal.dropna().round(1)
         return {"seasonal_component": seasonal.to_dict()}
     except Exception as e:
         logger.info(f"Seasonality decomposition failed: {e}")
-        # Fallback
-        return compute_monthly_profile(ts)
-
-
-def compute_monthly_profile(ts: pd.DataFrame) -> Optional[Dict[int, float]]:
-    """Fallback monthly average profile {1..12: mean}."""
-    if ts is None or ts.empty or "date" not in ts or "value" not in ts:
         return None
-    if len(ts) < 18:
-        return None
-    tmp = ts.copy()
-    tmp["month"] = pd.to_datetime(tmp["date"]).dt.month
-    monthly = tmp.groupby("month")["value"].mean().round(1)
-    if monthly.empty:
-        return None
-    return {int(m): float(v) for m, v in monthly.to_dict().items()}
 
-
-def forecast_linear(ts: pd.DataFrame, target_date: str) -> Optional[float]:
-    if ts is None or ts.empty or len(ts) < 2:
+def forecast_arima(ts: pd.DataFrame, steps: int = 12) -> Optional[Dict[str, float]]:
+    if ts is None or ts.empty or len(ts) < 36:
         return None
     try:
-        base = pd.to_datetime(ts["date"])
-        x = (base - base.min()).dt.days.values
-        y = ts["value"].astype(float).values
-        coeffs = np.polyfit(x, y, 1)
-        target_x = (pd.to_datetime(target_date) - base.min()).days
-        pred = float(np.polyval(coeffs, target_x))
-        return round(pred, 1)
+        ts_copy = ts.set_index("date").sort_index().asfreq("M", method="ffill")
+        model = ARIMA(ts_copy["value"], order=(1, 1, 1), seasonal_order=(1, 1, 1, 12)).fit()
+        forecast = model.forecast(steps=steps)
+        out = {pd.to_datetime(d).strftime("%Y-%m"): float(v) for d, v in zip(forecast.index, forecast.values)}
+        return out
     except Exception as e:
-        logger.info(f"forecast failed: {e}")
+        logger.info(f"ARIMA forecast failed: {e}")
         return None
-
 
 def contains_future_intent(q: str) -> bool:
     ql = q.lower()
     return any(w in ql for w in ["forecast", "predict", "expected", "future", "projection", "2030", "2035", "next year", "next 5 years", "maintains"])
-
 
 # ---------------- LLM analysis pass ----------------
 ANALYST_SYSTEM = """
@@ -433,9 +356,9 @@ Do NOT mention SQL, schema, tables, or columns. Write a clear, concise analysis:
 - Direction & approximate % change from first to last point.
 - Peaks and lows (when and how much).
 - Anomalies (outliers) if any.
-- Seasonality: infer only from the provided seasonal component or monthly profile. You may note typical domain patterns (e.g., hydro peaks in spring/summer, thermal in winter), BUT anchor your comments strictly in the provided data.
-- If a forecast is implied, include the provided projection result(s) and caveat that it's a simple trend extrapolation.
-- For multiple series (e.g., hydro vs thermal), compare them succinctly.
+- Seasonality: infer only from the provided seasonal component or monthly profile.
+- If a forecast is provided, include the projection results and caveat that it's a model-based extrapolation.
+- For multiple series, compare them succinctly.
 - End with one short takeaway in plain language.
 Avoid jargon. Keep it grounded in the data below.
 """
@@ -448,7 +371,6 @@ def llm_analyst_answer(
     computed: Dict[str, Any],
     seasonality_info: Dict[str, Optional[Dict[str, Any]]]
 ) -> str:
-    # Build compact previews for the model
     lines = []
     for name, ts in series_dict.items():
         if "date" in ts.columns:
@@ -462,7 +384,6 @@ def llm_analyst_answer(
             cats = ts.sort_values("value", ascending=False).head(6)
             pairs = [f"{str(l)}:{round(float(v),1)}" for l, v in zip(cats["label"], cats["value"])]
             lines.append(f"{name} (top): {', '.join(pairs)}")
-
     stats = [f"{k}: {v}" for k, v in computed.items()]
     prompt = (
         f"User query: {user_query}\n"
@@ -471,7 +392,6 @@ def llm_analyst_answer(
         f"Computed stats:\n- " + "\n- ".join(stats) + "\n"
         "Write the answer now."
     )
-
     msg = llm.invoke([
         {"role": "system", "content": ANALYST_SYSTEM},
         {"role": "user", "content": prompt}
@@ -479,82 +399,43 @@ def llm_analyst_answer(
     content = getattr(msg, "content", str(msg)) if msg else ""
     return content.strip()
 
-
 # ---------------- Helpers to extract SQL ----------------
 def extract_sql_from_steps(steps: List[Any]) -> Optional[str]:
-    """
-    Robustly extract SQL from LangChain agent steps.
-    Supports:
-      - action["sql_cmd"]
-      - action["tool_input"]["query"]
-      - action["tool_input"] as a raw SQL string
-      - action.log or observation containing SQL
-    Handles AgentAction objects and prefers the last sql_db_query or sql_db_query_checker step.
-    """
     if not steps:
         return None
-
-    candidate_sql = None
-
-    for step in reversed(steps):  # Start from last to get the final SQL
+    for step in reversed(steps):
         try:
-            # Handle both tuple (action, observation) and single action
             if isinstance(step, tuple) and len(step) >= 2:
                 action, observation = step[0], step[1]
             else:
                 action = step
                 observation = ""
-
-            # Convert AgentAction to dict if necessary
             action_dict = action.dict() if isinstance(action, AgentAction) else action
-
             if not isinstance(action_dict, dict):
                 continue
-
-            # Check if the action is a query or query checker
             tool = action_dict.get("tool", "")
             if tool not in ["sql_db_query", "sql_db_query_checker"]:
                 continue
-
-            # Direct sql_cmd
             if "sql_cmd" in action_dict and isinstance(action_dict["sql_cmd"], str):
-                candidate_sql = action_dict["sql_cmd"]
-                break
-
-            # Tool_input might hold SQL
+                return action_dict["sql_cmd"]
             tool_input = action_dict.get("tool_input")
             if isinstance(tool_input, dict) and isinstance(tool_input.get("query"), str):
-                candidate_sql = tool_input["query"]
-                break
+                return tool_input["query"]
             if isinstance(tool_input, str) and tool_input.strip().upper().startswith("SELECT"):
-                candidate_sql = tool_input
-                break
-
-            # Fallback: parse from log or observation
+                return tool_input
             log = action_dict.get("log", "")
             if "SELECT" in log.upper():
-                # Improved regex to capture query inside dict string
-                match = re.search(r"query'\s*:\s*['\"](SELECT.*?;)['\"]", log, re.DOTALL | re.IGNORECASE)
-                if match:
-                    candidate_sql = match.group(1).strip()
-                    break
-                # Fallback to general SELECT
                 match = re.search(r"SELECT.*?($|;)", log, re.DOTALL | re.IGNORECASE)
                 if match:
-                    candidate_sql = match.group(0).strip()
-                    break
+                    return match.group(0).strip()
             if observation and isinstance(observation, str) and "SELECT" in observation.upper():
                 match = re.search(r"SELECT.*?($|;)", observation, re.DOTALL | re.IGNORECASE)
                 if match:
-                    candidate_sql = match.group(0).strip()
-                    break
+                    return match.group(0).strip()
         except Exception as e:
             logger.debug(f"Failed to extract SQL from step: {e}")
             continue
-
-    logger.info(f"Extracted SQL: {candidate_sql}")
-    return candidate_sql
-
+    return None
 
 # ---------------- Endpoints ----------------
 @app.get("/healthz")
@@ -566,21 +447,15 @@ def health():
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-
 @app.post("/ask", response_model=APIResponse)
 def ask(q: Question, x_app_key: str = Header(...)):
     import time
     start = time.time()
-
     if x_app_key != APP_SECRET_KEY:
         raise HTTPException(status_code=401, detail="Unauthorized")
-
     try:
-        # 1) Build memory-augmented context
         final_input = build_context(q.user_id, q.query)
-
-        # 2) Create SQL agent (generation only)
-        llm_agent = ChatOpenAI(model="gpt-4o", temperature=0, openai_api_key=OPENAI_API_KEY, request_timeout=45)
+        llm_agent = ChatOpenAI(model="gpt-4o", temperature=0, openai_api_key=OPENAI_API_KEY, request_timeout=60)
         toolkit = SQLDatabaseToolkit(db=db, llm=llm_agent)
         agent = create_sql_agent(
             llm=llm_agent,
@@ -591,86 +466,61 @@ def ask(q: Question, x_app_key: str = Header(...)):
             max_iterations=8,
             early_stopping_method="generate",
         )
-
-        # 3) Invoke agent with robust parsing
         try:
             result = agent.invoke({"input": final_input, "handle_parsing_errors": True}, return_intermediate_steps=True)
         except Exception as e:
-            logger.error(f"Agent parsing failed: {e}")
-            # Retry with raw query only
+            logger.error(f"Agent parsing failed, retrying with raw query only: {e}")
             result = agent.invoke({"input": q.query, "handle_parsing_errors": True}, return_intermediate_steps=True)
-
         output_text = result.get("output", "") or ""
         steps = result.get("intermediate_steps", []) or []
-        logger.info(f"Intermediate steps: {steps}")
-
-        # 4) Extract SQL and execute safely
         sql = extract_sql_from_steps(steps)
         if not sql:
             logger.warning(f"No SQL extracted from steps, falling back to agent output: {output_text}")
             ans = scrub_schema_mentions(output_text or "I don't know based on the available data.")
             return APIResponse(answer=ans, execution_time=round(time.time() - start, 2))
-
         sql = clean_sql(sql)
         validate_sql_is_safe(sql)
-
         with engine.connect() as conn:
             rows = conn.execute(text(sql)).fetchall()
-
         if not rows:
             ans = scrub_schema_mentions("I don't have data for that specific request.")
             return APIResponse(answer=ans, execution_time=round(time.time() - start, 2))
-
         df = coerce_dataframe(rows)
-
-        # If it does not look like a time series, just let the LLM summarize numbers
-        looks_ts = detect_timeseries(df)
         series_dict = extract_series(df)
         if not series_dict:
             ans = scrub_schema_mentions(output_text or "I don't know based on the available data.")
             return APIResponse(answer=ans, execution_time=round(time.time() - start, 2))
-
         unit = infer_unit_from_query(q.query)
-
-        # 5) Compute analytics per series (trend/extremes/anomalies/seasonality/forecast)
         computed: Dict[str, Any] = {}
         seasonality_info: Dict[str, Optional[Dict[str, Any]]] = {}
-
         for name, s in series_dict.items():
             if "date" in s.columns:
                 s = s.dropna()
                 if s.empty:
                     continue
-                # trend
                 tr = analyze_trend(s)
                 if tr:
                     direction, pct = tr
                     computed[f"{name}__trend"] = f"{direction} ({pct:+.1f}%)" if pct is not None else direction
-                # extremes
                 mx, mn = find_extremes(s)
                 if mx:
                     computed[f"{name}__peak"] = f"{mx[0].strftime('%Y-%m')}: {round(mx[1],1)}"
                 if mn:
                     computed[f"{name}__low"] = f"{mn[0].strftime('%Y-%m')}: {round(mn[1],1)}"
-                # anomalies
                 anomalies = find_anomalies(s)
                 if anomalies:
                     computed[f"{name}__anomalies"] = [f"{d.strftime('%Y-%m')}: {round(v,1)}" for d, v in anomalies]
-                # seasonality
                 si = compute_seasonality(s)
                 if si:
                     seasonality_info[name] = si
                 else:
                     seasonality_info[name] = None
-                # forecast if implied
                 if contains_future_intent(q.query):
-                    target = "2030-12-01" if "2030" in q.query.lower() else (pd.to_datetime(s["date"]).max() + pd.DateOffset(years=5)).strftime("%Y-%m-%d")
-                    pred = forecast_linear(s, target)
+                    pred = forecast_arima(s)
                     if pred is not None:
-                        computed[f"{name}__forecast_{target}"] = pred
+                        computed[f"{name}__forecast"] = pred
                 series_dict[name] = s
             else:
-                # categories-only (no date)
                 total = float(s["value"].sum())
                 computed[f"{name}__total"] = round(total, 1)
                 if not s.empty:
@@ -678,18 +528,13 @@ def ask(q: Question, x_app_key: str = Header(...)):
                     share = (float(top_row["value"]) / total * 100) if total > 0 else 0
                     computed[f"{name}__top"] = f"{str(top_row['label'])}: {round(float(top_row['value']),1)} ({share:.1f}% share)"
 
-        # 6) LLM analysis pass (final narrative)
-        llm_analyst = ChatOpenAI(model="gpt-4o", temperature=0.2, openai_api_key=OPENAI_API_KEY, request_timeout=45)
+        llm_analyst = ChatOpenAI(model="gpt-4o", temperature=0.2, openai_api_key=OPENAI_API_KEY, request_timeout=60)
         final_text = llm_analyst_answer(llm_analyst, q.query, unit, series_dict, computed, seasonality_info)
-
         if not final_text.strip():
             lines = [f"{k}: {v}" for k, v in sorted(computed.items())]
             final_text = "Here is a numeric summary based on the available data:\n" + "\n".join(lines)
-
         final_text = scrub_schema_mentions(final_text)
-
         return APIResponse(answer=final_text, execution_time=round(time.time() - start, 2))
-
     except SQLAlchemyError as e:
         logger.error(f"DB error: {e}")
         raise HTTPException(status_code=500, detail="Database error")
