@@ -1,4 +1,3 @@
-```python
 import os
 import re
 import logging
@@ -662,4 +661,3 @@ def ask(q: Question, x_app_key: str = Header(...)):
     except Exception as e:
         logger.error(f"Processing error: {e}")
         raise HTTPException(status_code=500, detail="Processing error")
-```
