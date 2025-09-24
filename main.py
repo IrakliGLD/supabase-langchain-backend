@@ -136,7 +136,7 @@ def convert_decimal_to_float(obj):
     if isinstance(obj, list):
         return [convert_decimal_to_float(x) for x in obj]
     if isinstance(obj, tuple):
-        return tuple(convert_decimal_to_float(x) for x in obj]
+        return tuple(convert_decimal_to_float(x) for x in obj)
     if isinstance(obj, dict):
         return {k: convert_decimal_to_float(v) for k, v in obj.items()}
     return obj
