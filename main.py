@@ -12,7 +12,8 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.pool import QueuePool
 from langchain_openai import ChatOpenAI
 from langchain_community.utilities import SQLDatabase
-from langchain.agents import create_sql_agent, AgentAction
+from langchain.agents import create_sql_agent
+from langchain_core.agents import AgentAction
 from langchain.agents.agent_toolkits import SQLDatabaseToolkit
 from dotenv import load_dotenv
 from decimal import Decimal
