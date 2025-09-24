@@ -444,6 +444,8 @@ def health():
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+# ... (rest of the code is the same) ...
+
 @app.post("/ask", response_model=APIResponse)
 def ask(q: Question, x_app_key: str = Header(...)):
     import time
@@ -454,7 +456,7 @@ def ask(q: Question, x_app_key: str = Header(...)):
         final_input = build_context(q.user_id, q.query)
         llm_agent = ChatOpenAI(model="gpt-4o", temperature=0, openai_api_key=OPENAI_API_KEY, request_timeout=60)
         
-        # New: Define a custom tool for full-series queries
+        # Define a custom tool for full-series queries
         def run_full_series_query(query: str) -> str:
             cleaned_query = clean_sql(query)
             validate_sql_is_safe(cleaned_query)
@@ -474,24 +476,25 @@ def ask(q: Question, x_app_key: str = Header(...)):
         ]
 
         toolkit = SQLDatabaseToolkit(db=db, llm=llm_agent)
-        toolkit_tools = toolkit.get_tools()
         
-        # Remove the default sql_db_query tool to force the agent to use the new one for analysis
-        toolkit_tools = [t for t in toolkit_tools if t.name != "sql_db_query"]
-        
-        # Merge our custom tool with the default tools (like list_tables and schema)
-        all_tools = toolkit_tools + custom_tools
+        # Get all default tools except the one we want to replace
+        all_tools = [t for t in toolkit.get_tools() if t.name not in ["sql_db_query", "sql_db_query_checker"]]
+
+        # Add the custom tool
+        all_tools.extend(custom_tools)
 
         agent = create_sql_agent(
             llm=llm_agent,
             toolkit=toolkit,
-            tools=all_tools,
+            tools=all_tools, # Use the new, filtered list of tools
             verbose=True,
             agent_type="openai-tools",
             system_message=SYSTEM_PROMPT,
             max_iterations=8,
             early_stopping_method="generate",
         )
+        
+        # ... (rest of the try-except block is the same) ...
         
         try:
             result = agent.invoke({"input": final_input, "handle_parsing_errors": True}, return_intermediate_steps=True)
