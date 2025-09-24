@@ -4,7 +4,6 @@ import logging
 from datetime import datetime
 from typing import Optional, Dict, Any, List, Tuple
 
-
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, validator
@@ -15,6 +14,7 @@ from langchain_openai import ChatOpenAI
 from langchain_community.utilities import SQLDatabase
 from langchain.agents import create_sql_agent
 from langchain.agents.agent_toolkits import SQLDatabaseToolkit
+from langchain.agents.agent_types import AgentAction
 from dotenv import load_dotenv
 from decimal import Decimal
 import numpy as np
@@ -82,7 +82,7 @@ You are EnerBot, an autonomous Georgian electricity market analyst.
 - Always analyze instead of listing: trend direction, % change (first→last), peaks/lows, anomalies, and seasonality if the pattern exists.
 - If the user implies a forecast or "if the current trend maintains…", compute a forward-looking projection from the available data.
 - Always answer in plain language with units when applicable and end with a one-line key insight.
-- For trends, seasonality, or time-based analysis, ALWAYS query the FULL dataset without any LIMIT, sampling, or truncation to ensure accurate and complete calculations. Do NOT use LIMIT unless the user explicitly requests a small sample.
+- For trends, seasonality, or time-based analysis, ALWAYS query the FULL dataset without any LIMIT, sampling, or truncation to ensure accurate and complete calculations. Do NOT use LIMIT or OFFSET unless the user explicitly requests a small sample (e.g., "show me 10 rows").
 
 === DATASET SELECTION (based on the internal schema only) ===
 (1) Choose the dataset solely from the schema descriptions in the internal context:
@@ -193,7 +193,7 @@ def build_context(user_id: Optional[str], user_query: str) -> str:
 def clean_sql(sql: str) -> str:
     if not sql:
         return sql
-    # Combine removal of ```sql
+    # Combine removal of ```sql and ``` delimiters, handle optional whitespace
     sql = re.sub(r"```(?:sql)?\s*|\s*```", "", sql, flags=re.IGNORECASE)
     # Remove SQL comments
     sql = re.sub(r"--.*?$", "", sql, flags=re.MULTILINE)
@@ -222,7 +222,7 @@ def coerce_dataframe(rows: List[tuple]) -> pd.DataFrame:
     if not rows:
         return pd.DataFrame()
     df = pd.DataFrame([list(r) for r in rows])
-    df = df.applymap(convert_decimal_to_float)
+    df = df.map(convert_decimal_to_float)
     return df
 
 
@@ -351,15 +351,15 @@ def compute_seasonality(ts: pd.DataFrame) -> Optional[Dict[str, Any]]:
     
     try:
         # Assume monthly data, period=12
-        ts = ts.set_index("date").sort_index()
-        ts = ts.asfreq("M", method="pad")  # Resample to monthly if needed
-        decomp = sm.tsa.seasonal_decompose(ts["value"], model="additive", period=12)
+        ts_copy = ts.set_index("date").sort_index()
+        ts_copy = ts_copy.asfreq("M", method="ffill")  # Use ffill instead of pad (deprecated)
+        decomp = sm.tsa.seasonal_decompose(ts_copy["value"], model="additive", period=12)
         seasonal = decomp.seasonal.dropna().round(1)
         return {"seasonal_component": seasonal.to_dict()}
     except Exception as e:
         logger.info(f"Seasonality decomposition failed: {e}")
         # Fallback
-        return compute_monthly_profile(ts.reset_index().rename(columns={"index": "date"}))
+        return compute_monthly_profile(ts)
 
 
 def compute_monthly_profile(ts: pd.DataFrame) -> Optional[Dict[int, float]]:
@@ -460,7 +460,7 @@ def extract_sql_from_steps(steps: List[Any]) -> Optional[str]:
       - action["tool_input"]["query"]
       - action["tool_input"] as a raw SQL string
       - action.log or observation containing SQL
-    Prefers the *last* sql_db_query or sql_db_query_checker step.
+    Handles AgentAction objects and prefers the last sql_db_query or sql_db_query_checker step.
     """
     if not steps:
         return None
@@ -469,22 +469,31 @@ def extract_sql_from_steps(steps: List[Any]) -> Optional[str]:
 
     for step in reversed(steps):  # Start from last to get the final SQL
         try:
+            # Handle both tuple (action, observation) and single action
             if isinstance(step, tuple) and len(step) >= 2:
                 action, observation = step[0], step[1]
             else:
                 action = step
                 observation = ""
 
-            if not isinstance(action, dict):
+            # Convert AgentAction to dict if necessary
+            action_dict = action.dict() if isinstance(action, AgentAction) else action
+
+            if not isinstance(action_dict, dict):
                 continue
 
-            # direct sql_cmd
-            if "sql_cmd" in action and isinstance(action["sql_cmd"], str):
-                candidate_sql = action["sql_cmd"]
-                break  # Prefer the last one
+            # Check if the action is a query or query checker
+            tool = action_dict.get("tool", "")
+            if tool not in ["sql_db_query", "sql_db_query_checker"]:
+                continue
 
-            # tool_input might hold SQL
-            tool_input = action.get("tool_input")
+            # Direct sql_cmd
+            if "sql_cmd" in action_dict and isinstance(action_dict["sql_cmd"], str):
+                candidate_sql = action_dict["sql_cmd"]
+                break
+
+            # Tool_input might hold SQL
+            tool_input = action_dict.get("tool_input")
             if isinstance(tool_input, dict) and isinstance(tool_input.get("query"), str):
                 candidate_sql = tool_input["query"]
                 break
@@ -493,18 +502,19 @@ def extract_sql_from_steps(steps: List[Any]) -> Optional[str]:
                 break
 
             # Fallback: parse from log or observation
-            log = action.get("log", "")
+            log = action_dict.get("log", "")
             if "SELECT" in log.upper():
-                match = re.search(r"SELECT.*?;", log, re.DOTALL | re.IGNORECASE)
+                match = re.search(r"SELECT.*?($|;)", log, re.DOTALL | re.IGNORECASE)
                 if match:
-                    candidate_sql = match.group(0)
+                    candidate_sql = match.group(0).strip()
                     break
-            if "SELECT" in observation.upper():
-                match = re.search(r"SELECT.*?;", observation, re.DOTALL | re.IGNORECASE)
+            if observation and isinstance(observation, str) and "SELECT" in observation.upper():
+                match = re.search(r"SELECT.*?($|;)", observation, re.DOTALL | re.IGNORECASE)
                 if match:
-                    candidate_sql = match.group(0)
+                    candidate_sql = match.group(0).strip()
                     break
-        except Exception:
+        except Exception as e:
+            logger.debug(f"Failed to extract SQL from step: {e}")
             continue
 
     return candidate_sql
@@ -551,7 +561,7 @@ def ask(q: Question, x_app_key: str = Header(...)):
             result = agent.invoke({"input": final_input, "handle_parsing_errors": True}, return_intermediate_steps=True)
         except Exception as e:
             logger.error(f"Agent parsing failed: {e}")
-            # retry with raw query only
+            # Retry with raw query only
             result = agent.invoke({"input": q.query, "handle_parsing_errors": True}, return_intermediate_steps=True)
 
         output_text = result.get("output", "") or ""
@@ -560,6 +570,7 @@ def ask(q: Question, x_app_key: str = Header(...)):
         # 4) Extract SQL and execute safely
         sql = extract_sql_from_steps(steps)
         if not sql:
+            logger.warning(f"No SQL extracted from steps, falling back to agent output: {output_text}")
             ans = scrub_schema_mentions(output_text or "I don't know based on the available data.")
             return APIResponse(answer=ans, execution_time=round(time.time() - start, 2))
 
