@@ -533,6 +533,12 @@ def extract_sql_from_steps(steps: List[Any]) -> Optional[str]:
             # Fallback: parse from log or observation
             log = action_dict.get("log", "")
             if "SELECT" in log.upper():
+                # Improved regex to capture query inside dict string
+                match = re.search(r"query'\s*:\s*['\"](SELECT.*?;)['\"]", log, re.DOTALL | re.IGNORECASE)
+                if match:
+                    candidate_sql = match.group(1).strip()
+                    break
+                # Fallback to general SELECT
                 match = re.search(r"SELECT.*?($|;)", log, re.DOTALL | re.IGNORECASE)
                 if match:
                     candidate_sql = match.group(0).strip()
@@ -546,6 +552,7 @@ def extract_sql_from_steps(steps: List[Any]) -> Optional[str]:
             logger.debug(f"Failed to extract SQL from step: {e}")
             continue
 
+    logger.info(f"Extracted SQL: {candidate_sql}")
     return candidate_sql
 
 
@@ -595,6 +602,7 @@ def ask(q: Question, x_app_key: str = Header(...)):
 
         output_text = result.get("output", "") or ""
         steps = result.get("intermediate_steps", []) or []
+        logger.info(f"Intermediate steps: {steps}")
 
         # 4) Extract SQL and execute safely
         sql = extract_sql_from_steps(steps)
