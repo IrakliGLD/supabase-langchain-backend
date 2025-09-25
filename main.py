@@ -1,6 +1,3 @@
-# === main.py v16.4 ===
-# Backend logic, imports schema from context.py
-
 import os
 import re
 import logging
@@ -12,6 +9,7 @@ from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, validator
 from sqlalchemy import create_engine, text
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.pool import QueuePool
 
 from langchain_openai import ChatOpenAI
@@ -26,9 +24,6 @@ import numpy as np
 import pandas as pd
 import statsmodels.api as sm
 
-# --- Import schema & joins ---
-from context import DB_SCHEMA_DOC, DB_JOINS
-
 # --- Configuration & Setup ---
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("enerbot")
@@ -41,23 +36,25 @@ APP_SECRET_KEY = os.getenv("APP_SECRET_KEY")
 if not all([OPENAI_API_KEY, SUPABASE_DB_URL, APP_SECRET_KEY]):
     raise RuntimeError("One or more essential environment variables are missing.")
 
+# --- Import DB Schema & Joins ---
+from context import DB_SCHEMA_DOC, DB_JOINS
+
+ALLOWED_TABLES = [
+    "energy_balance_long", "entities", "monthly_cpi",
+    "price", "tariff_gen", "tech_quantity", "trade", "dates"
+]
+
 engine = create_engine(SUPABASE_DB_URL, poolclass=QueuePool, pool_size=10, pool_pre_ping=True)
-db = SQLDatabase(engine, include_tables=list(DB_JOINS.keys()))
+db = SQLDatabase(engine, include_tables=ALLOWED_TABLES)
 
 # --- FastAPI Application ---
-app = FastAPI(title="EnerBot Backend", version="16.4")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"]
-)
+app = FastAPI(title="EnerBot Backend", version="16.5-forecasting")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 # --- System Prompts ---
 SQL_GENERATOR_PROMPT = f"""
 ### ROLE ###
-You are an expert SQL writer. Your sole purpose is to generate a single, syntactically correct SQL query
+You are an expert SQL writer. Your sole purpose is to generate a single, syntactically correct SQL query 
 to answer the user's question based on the provided database schema and join information.
 
 ### MANDATORY RULES ###
@@ -71,20 +68,20 @@ DB_JOINS = {DB_JOINS}
 """
 
 ANALYST_PROMPT = """
-You are an expert energy market analyst. Your task is to write a clear, concise narrative based *only* on
-the structured data provided to you.
+You are an expert energy market analyst. Your task is to write a clear, concise narrative based *only* 
+on the structured data provided to you.
 
 ### MANDATORY RULES ###
 1.  **NEVER GUESS.** Use ONLY the numbers and facts provided in the "Computed Stats" section.
 2.  **NEVER REVEAL INTERNALS.** Do not mention the database, SQL, or technical jargon.
-3.  **ALWAYS BE AN ANALYST.** Your response must be a narrative including trends, peaks, lows, and seasonality.
+3.  **ALWAYS BE AN ANALYST.** Your response must be a narrative including trends, peaks, lows, 
+    seasonality, and forecasts (if available).
 4.  **CONCLUDE SUCCINCTLY.** End with a single, short "Key Insight" line.
 """
 
 # --- Pydantic Models ---
 class Question(BaseModel):
     query: str = Field(..., max_length=2000)
-
     @validator("query")
     def validate_query(cls, v):
         if not v.strip():
@@ -121,19 +118,14 @@ def extract_sql_from_steps(steps: List[Any]) -> Optional[str]:
     return sql_query
 
 def convert_decimal_to_float(obj):
-    if isinstance(obj, Decimal):
-        return float(obj)
-    if isinstance(obj, list):
-        return [convert_decimal_to_float(x) for x in obj]
-    if isinstance(obj, tuple):
-        return tuple(convert_decimal_to_float(x) for x in obj)
-    if isinstance(obj, dict):
-        return {k: convert_decimal_to_float(v) for k, v in obj.items()}
+    if isinstance(obj, Decimal): return float(obj)
+    if isinstance(obj, list): return [convert_decimal_to_float(x) for x in obj]
+    if isinstance(obj, tuple): return tuple(convert_decimal_to_float(x) for x in obj)
+    if isinstance(obj, dict): return {k: convert_decimal_to_float(v) for k, v in obj.items()}
     return obj
 
 def coerce_dataframe(rows: List[tuple], columns: List[str]) -> pd.DataFrame:
-    if not rows:
-        return pd.DataFrame()
+    if not rows: return pd.DataFrame()
     df = pd.DataFrame(rows, columns=columns)
     for col in df.columns:
         if df[col].dtype == 'object':
@@ -142,12 +134,8 @@ def coerce_dataframe(rows: List[tuple], columns: List[str]) -> pd.DataFrame:
 
 def extract_series(df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
     out: Dict[str, pd.DataFrame] = {}
-    if df.empty:
-        return out
-    date_col_name = next(
-        (c for c in df.columns if pd.api.types.is_datetime64_any_dtype(pd.to_datetime(df[c], errors='coerce'))),
-        None
-    )
+    if df.empty: return out
+    date_col_name = next((c for c in df.columns if pd.api.types.is_datetime64_any_dtype(pd.to_datetime(df[c], errors='coerce'))), None)
     if date_col_name:
         df[date_col_name] = pd.to_datetime(df[date_col_name])
         numeric_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
@@ -155,42 +143,31 @@ def extract_series(df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
         if numeric_cols and cat_cols:
             value_col, category_col = numeric_cols[0], cat_cols[0]
             for cat_val, group in df.groupby(category_col):
-                out[str(cat_val)] = (
-                    group[[date_col_name, value_col]]
-                    .rename(columns={date_col_name: "date", value_col: "value"})
-                    .sort_values("date")
-                    .reset_index(drop=True)
-                )
+                out[str(cat_val)] = group[[date_col_name, value_col]].rename(
+                    columns={date_col_name: "date", value_col: "value"}).sort_values("date").reset_index(drop=True)
         elif numeric_cols:
-            out["series"] = (
-                df[[date_col_name, numeric_cols[0]]]
-                .rename(columns={date_col_name: "date", numeric_cols[0]: "value"})
-                .sort_values("date")
-                .reset_index(drop=True)
-            )
+            out["series"] = df[[date_col_name, numeric_cols[0]]].rename(
+                columns={date_col_name: "date", numeric_cols[0]: "value"}).sort_values("date").reset_index(drop=True)
     return out
 
 def analyze_trend(ts: pd.DataFrame) -> Optional[Tuple[str, float]]:
-    if ts.empty or len(ts) < 2:
-        return None
+    if ts.empty or len(ts) < 2: return None
     first, last = ts["value"].iloc[0], ts["value"].iloc[-1]
     direction = "increasing" if last > first else "decreasing" if last < first else "stable"
     pct = ((last - first) / abs(first) * 100) if first != 0 else 0.0
     return direction, round(pct, 1)
 
 def find_extremes(ts: pd.DataFrame) -> Tuple[Optional[Dict], Optional[Dict]]:
-    if ts.empty or "date" not in ts.columns:
-        return None, None
+    if ts.empty or "date" not in ts.columns: return None, None
     max_row = ts.loc[ts["value"].idxmax()]
     min_row = ts.loc[ts["value"].idxmin()]
     return (
         {"date": max_row["date"].strftime('%Y-%m'), "value": round(max_row["value"], 1)},
-        {"date": min_row["date"].strftime('%Y-%m'), "value": round(min_row["value"], 1)},
+        {"date": min_row["date"].strftime('%Y-%m'), "value": round(min_row["value"], 1)}
     )
 
 def compute_seasonality(ts: pd.DataFrame) -> Optional[Dict[str, Any]]:
-    if len(ts) < 24 or "date" not in ts.columns:
-        return None
+    if len(ts) < 24 or "date" not in ts.columns: return None
     try:
         ts_monthly = ts.set_index('date')['value'].asfreq('MS').ffill()
         decomp = sm.tsa.seasonal_decompose(ts_monthly.dropna(), model="additive", period=12)
@@ -204,13 +181,87 @@ def compute_seasonality(ts: pd.DataFrame) -> Optional[Dict[str, Any]]:
 
 def infer_unit_from_query(query: str) -> str:
     q = query.lower()
-    if any(w in q for w in ["price", "tariff", "cost"]):
-        return "GEL"
-    if any(w in q for w in ["generation", "consumption", "energy", "trade"]):
-        return "TJ"
-    if any(w in q for w in ["capacity", "power"]):
-        return "MW"
+    if any(w in q for w in ["price", "tariff", "cost"]): return "GEL"
+    if any(w in q for w in ["generation", "consumption", "energy", "trade"]): return "TJ"
+    if any(w in q for w in ["capacity", "power"]): return "MW"
     return "units"
+
+# --- Forecasting helpers (NEW) ---
+MONTH_ALIASES = {
+    "jan": 1, "january": 1,
+    "feb": 2, "february": 2,
+    "mar": 3, "march": 3,
+    "apr": 4, "april": 4,
+    "may": 5,
+    "jun": 6, "june": 6,
+    "jul": 7, "july": 7,
+    "aug": 8, "august": 8,
+    "sep": 9, "sept": 9, "september": 9,
+    "oct": 10, "october": 10,
+    "nov": 11, "november": 11,
+    "dec": 12, "december": 12,
+}
+
+def _parse_target_date_from_query(q: str) -> Optional[datetime]:
+    ql = q.lower()
+    m_year = re.search(r"\b(20\d{2})\b", ql)
+    if not m_year: return None
+    year = int(m_year.group(1))
+    month = None
+    for token, mnum in MONTH_ALIASES.items():
+        if re.search(rf"\b{re.escape(token)}\b", ql):
+            month = mnum
+            break
+    if not month:
+        m_ym = re.search(rf"\b{year}[-/](\d{{1,2}})\b", ql)
+        if m_ym:
+            month = max(1, min(12, int(m_ym.group(1))))
+    if month is None: month = 1
+    return datetime(year, month, 1)
+
+def detect_forecast_intent(user_query: str) -> Tuple[bool, Optional[datetime]]:
+    ql = user_query.lower()
+    wants = any(k in ql for k in ["forecast", "project", "projection", "predict", "estimate", "by ", "until ", "through "])
+    target_dt = _parse_target_date_from_query(user_query) if wants else None
+    return wants, target_dt
+
+def months_since(start: datetime, current: datetime) -> int:
+    return (current.year - start.year) * 12 + (current.month - start.month)
+
+def forecast_linear_ols(df: pd.DataFrame, date_col: str = "date", value_col: str = "p_bal_gel", target_date: Optional[datetime] = None) -> Optional[Dict[str, Any]]:
+    if df.empty or date_col not in df.columns or value_col not in df.columns:
+        return None
+    s = df[[date_col, value_col]].dropna().copy()
+    if s.empty: return None
+    s[date_col] = pd.to_datetime(s[date_col])
+    s.sort_values(date_col, inplace=True)
+    t0 = s[date_col].iloc[0].to_pydatetime()
+    s["t"] = s[date_col].apply(lambda d: months_since(t0, d.to_pydatetime()))
+    y = s[value_col].astype(float).values
+    X = sm.add_constant(s["t"].values.astype(float))
+    try:
+        model = sm.OLS(y, X).fit()
+    except Exception as e:
+        logger.warning(f"OLS failed: {e}")
+        return None
+    if target_date is None:
+        target_date = (s[date_col].iloc[-1] + pd.DateOffset(months=60)).to_pydatetime()
+    t_target = months_since(t0, target_date)
+    X_new = sm.add_constant(np.array([t_target], dtype=float))
+    try:
+        pred = model.get_prediction(X_new).summary_frame(alpha=0.05).iloc[0]
+        return {
+            "target_month": target_date.strftime("%Y-%m"),
+            "point": float(pred["mean"]),
+            "ci_lower": float(pred["mean_ci_lower"]),
+            "ci_upper": float(pred["mean_ci_upper"]),
+            "slope_per_month": float(model.params[1]) if len(model.params) > 1 else None,
+            "r2": float(model.rsquared),
+            "n_obs": int(model.nobs),
+        }
+    except Exception as e:
+        logger.warning(f"Prediction failed: {e}")
+        return None
 
 def run_full_analysis_pipeline(df: pd.DataFrame, user_query: str) -> Tuple[Dict, str]:
     logger.info("Running full Python analysis pipeline...")
@@ -218,44 +269,28 @@ def run_full_analysis_pipeline(df: pd.DataFrame, user_query: str) -> Tuple[Dict,
     computed = {}
     for name, s in series_dict.items():
         if "date" in s.columns and not s.empty:
-            if trend := analyze_trend(s):
-                computed[f"{name} Trend"] = f"{trend[0]} ({trend[1]:+g}%)"
+            if trend := analyze_trend(s): computed[f"{name} Trend"] = f"{trend[0]} ({trend[1]:+g}%)"
             peak, low = find_extremes(s)
-            if peak:
-                computed[f"{name} Peak"] = peak
-            if low:
-                computed[f"{name} Low"] = low
-            if seasonality := compute_seasonality(s):
-                computed[f"{name} Seasonality"] = seasonality
+            if peak: computed[f"{name} Peak"] = peak
+            if low: computed[f"{name} Low"] = low
+            if seasonality := compute_seasonality(s): computed[f"{name} Seasonality"] = seasonality
     unit = infer_unit_from_query(user_query)
     return computed, unit
 
 def generate_final_narrative(llm: ChatOpenAI, user_query: str, unit: str, computed: Dict) -> str:
-    stats_str = (
-        "\n- ".join([f"{k}: {v}" for k, v in computed.items()])
-        if computed
-        else "No specific trends or stats were calculated."
-    )
+    stats_str = "\n- ".join([f"{k}: {v}" for k, v in computed.items()]) if computed else "No specific trends or stats were calculated."
     prompt = f"User query: {user_query}\nUnit: {unit}\nComputed Stats:\n- {stats_str}"
-    msg = llm.invoke(
-        [{"role": "system", "content": ANALYST_PROMPT}, {"role": "user", "content": prompt}]
-    )
+    msg = llm.invoke([{"role": "system", "content": ANALYST_PROMPT}, {"role": "user", "content": prompt}])
     return getattr(msg, "content", "Could not generate a narrative.").strip()
 
 def scrub_schema_mentions(text: str) -> str:
-    if not text:
-        return text
-    for t in DB_JOINS.keys():
-        text = re.sub(rf"\b{re.escape(t)}\b", "the database", text, flags=re.IGNORECASE)
-    text = re.sub(
-        r"\b(schema|table|column|sql|join|primary key|foreign key|view|constraint)\b",
-        "data",
-        text,
-        flags=re.IGNORECASE,
-    )
+    if not text: return text
+    for t in ALLOWED_TABLES:
+        text = re.sub(rf"\b{re.escape(t)}\b", "the data", text, flags=re.IGNORECASE)
+    text = re.sub(r"\b(schema|table|column|sql|join|primary key|foreign key|view|constraint)\b", "data", text, flags=re.IGNORECASE)
     return text.replace("```", "").strip()
 
-# --- API Endpoints ---
+# --- API Endpoint ---
 @app.get("/healthz")
 def health():
     return {"status": "ok"}
@@ -265,7 +300,6 @@ def ask(q: Question, x_app_key: str = Header(...)):
     start_time = time.time()
     if x_app_key != APP_SECRET_KEY:
         raise HTTPException(status_code=401, detail="Unauthorized")
-
     try:
         llm = ChatOpenAI(model="gpt-4o", temperature=0, openai_api_key=OPENAI_API_KEY)
         toolkit = SQLDatabaseToolkit(db=db, llm=llm)
@@ -276,16 +310,15 @@ def ask(q: Question, x_app_key: str = Header(...)):
             verbose=True,
             agent_type="openai-tools",
             system_message=SQL_GENERATOR_PROMPT,
-            top_k=10000,  # increased from 1000 → 10000
+            top_k=10000
         )
 
         logger.info("Step 1: Invoking agent to generate SQL.")
         result = agent.invoke({"input": q.query}, return_intermediate_steps=True)
-
         sql_query = extract_sql_from_steps(result.get("intermediate_steps", []))
 
         if not sql_query:
-            logger.warning("Agent failed to generate a SQL query. Using text response as fallback.")
+            logger.warning("Agent failed to generate a SQL query. Using its text response as a fallback.")
             final_answer = result.get("output", "I was unable to formulate a query to answer the question.")
         else:
             logger.info(f"Step 2: SQL extracted: {sql_query}")
@@ -298,17 +331,34 @@ def ask(q: Question, x_app_key: str = Header(...)):
                 columns = list(cursor_result.keys())
 
             if not rows:
-                logger.warning("Query returned no results. Falling back to agent's explanation.")
+                logger.warning("Query returned no results. Falling back to agent output.")
                 final_answer = result.get("output", "The query executed successfully but returned no data.")
             else:
-                logger.info(f"Step 4: Retrieved {len(rows)} rows. Running analysis pipeline.")
+                logger.info(f"Step 4: Retrieved {len(rows)} rows. Running analysis.")
                 df = coerce_dataframe(rows, columns)
                 computed, unit = run_full_analysis_pipeline(df, q.query)
+
+                # Forecast integration
+                do_forecast, target_dt = detect_forecast_intent(q.query)
+                if do_forecast:
+                    candidate_cols = [c for c in df.columns if c.lower() in ("p_bal_gel", "p_bal", "balancing_price", "price")]
+                    value_col = "p_bal_gel" if "p_bal_gel" in df.columns else (candidate_cols[0] if candidate_cols else None)
+                    if "date" in df.columns and value_col:
+                        fc = forecast_linear_ols(df, date_col="date", value_col=value_col, target_date=target_dt)
+                        if fc:
+                            computed[f"Balancing Price Forecast ({fc['target_month']})"] = {
+                                "point": round(fc["point"], 2),
+                                "95% CI": [round(fc["ci_lower"], 2), round(fc["ci_upper"], 2)],
+                                "slope_per_month": round(fc["slope_per_month"], 4) if fc["slope_per_month"] is not None else None,
+                                "R²": round(fc["r2"], 3),
+                                "obs": fc["n_obs"],
+                            }
+                        else:
+                            logger.info("Forecast intent detected, but forecasting failed.")
+
                 final_answer = generate_final_narrative(llm, q.query, unit, computed)
 
-        return APIResponse(answer=scrub_schema_mentions(final_answer),
-                           execution_time=round(time.time() - start_time, 2))
-
+        return APIResponse(answer=scrub_schema_mentions(final_answer), execution_time=round(time.time() - start_time, 2))
     except Exception as e:
         logger.error(f"FATAL error in /ask endpoint: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="An internal processing error occurred.")
