@@ -25,11 +25,6 @@ import pandas as pd
 import statsmodels.api as sm
 
 # --- Configuration & Setup ---
-try:
-    from context import DB_SCHEMA_DOC
-except ImportError:
-    DB_SCHEMA_DOC = "Schema documentation is not available."
-
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("enerbot")
 
@@ -41,19 +36,78 @@ APP_SECRET_KEY = os.getenv("APP_SECRET_KEY")
 if not all([OPENAI_API_KEY, SUPABASE_DB_URL, APP_SECRET_KEY]):
     raise RuntimeError("One or more essential environment variables are missing.")
 
-# --- Database & Join Knowledge Graph ---
+# --- Improved Schema Documentation & Join Knowledge ---
+
+DB_SCHEMA_DOC = """
+### Global Rules & Conversions ###
+- **General Rule:** You must only provide summaries and insights. Do not return raw data or full tables.
+- **Unit Conversion:** To compare between tables, use these factors:
+  - 1 TJ = 277.778 MWh
+  - `tech_quantity` and `trade` tables are in "thousand MWh". To compare with a value in MWh, multiply the quantity by 1000.
+- **Data Granularity:** All tables with a `date` column contain **monthly** data. The data is NOT available at a daily or weekly level.
+- **Timeframe:** Data generally spans from 2015 to the present.
+
+---
+### Table: public.entities ###
+Defines entities in the electricity sector.
+**Columns (Explicit Mapping):**
+- `entity_normalized`: The unique, standardized identifier. **Always use this column for analysis and joins.**
+- `type`: The classification (HPP, TPP, Solar, Wind).
+- `ownership`: The owner of the entity.
+**Common Entity Mappings (`entity` -> `entity_normalized`):**
+- Enguri HPP -> enghurhesi
+- Vartsikhe HPP -> varcikhehesi
+- Gardabani CCPP -> gardabani
+
+---
+### Table: public.tech_quantity ###
+Covers total electricity demand and supply side quantities.
+**Columns (Explicit Mapping):**
+- `date`: The month of the record.
+- `type_tech`: The category of supply or demand.
+- `quantity_tech`: The amount of electricity in **thousand MWh**.
+**Key Synonyms for `type_tech` column:**
+- User says "hydro generation", "HPP" -> Query for `type_tech = 'hydro'`
+- User says "thermal generation", "TPP" -> Query for `type_tech = 'thermal'`
+- User says "wind generation", "wind power plant" -> Query for `type_tech = 'wind'`
+- User says "imports" -> Query for `type_tech = 'import'`
+
+---
+### Table: public.price ###
+Contains monthly electricity market prices.
+**Columns (Explicit Mapping):**
+- `date`: The month of the record.
+- `p_bal_gel`: **Balancing electricity price** (GEL/MWH). This is a key market indicator.
+- `p_dereg_gel`: Price for deregulated plants in GEL/MWh.
+- `p_gcap_gel`: Guaranteed capacity fee in GEL/MWh.
+
+---
+### Table: public.tariff_gen ###
+Regulated tariffs for specific power plants.
+**Columns (Explicit Mapping):**
+- `date`: The month of the record.
+- `entity`: The name of the generating unit.
+- `tariff_gel`: The regulated tariff in GEL/MWh.
+**Crucial Logic:**
+- A missing tariff for a thermal plant in a given month means it did not generate electricity.
+- A missing tariff for a hydro plant from a month onwards means it was deregulated.
+"""
+
 ALLOWED_TABLES = ["energy_balance_long", "entities", "monthly_cpi", "price", "tariff_gen", "tech_quantity", "trade"]
+# Expanded join knowledge to make the agent's joins more reliable
 DB_JOINS = {
     "energy_balance_long": {"join_on": "date", "related_to": ["price", "trade"]},
     "price": {"join_on": "date", "related_to": ["energy_balance_long"]},
-    "trade": {"join_on": "date", "related_to": ["energy_balance_long"]},
+    "trade": {"join_on": "entity_normalized", "related_to": ["entities", "tariff_gen"]},
+    "tariff_gen": {"join_on": "entity_normalized", "related_to": ["entities", "trade"]},
+    "entities": {"join_on": "entity_normalized", "related_to": ["tariff_gen", "trade"]},
 }
 
 engine = create_engine(SUPABASE_DB_URL, poolclass=QueuePool, pool_size=10, pool_pre_ping=True)
 db = SQLDatabase(engine, include_tables=ALLOWED_TABLES)
 
 # --- FastAPI Application ---
-app = FastAPI(title="EnerBot Backend", version="14.0-final-complete")
+app = FastAPI(title="EnerBot Backend", version="15.0-final-context-aware")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 # --- System Prompts ---
