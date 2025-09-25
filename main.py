@@ -48,7 +48,7 @@ engine = create_engine(SUPABASE_DB_URL, poolclass=QueuePool, pool_size=10, pool_
 db = SQLDatabase(engine, include_tables=ALLOWED_TABLES)
 
 # --- FastAPI Application ---
-app = FastAPI(title="EnerBot Backend", version="16.6-retry-sql")
+app = FastAPI(title="EnerBot Backend", version="16.7-sql-fix")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 # --- System Prompts ---
@@ -139,8 +139,8 @@ def coerce_dataframe(rows: List[tuple], columns: List[str]) -> pd.DataFrame:
             df[col] = df[col].apply(convert_decimal_to_float)
     return df
 
-# --- (forecasting + analysis helpers from v16.5 unchanged) ---
-# ... [keep all helpers: extract_series, analyze_trend, forecast_linear_ols, etc.] ...
+# (keep forecasting + analysis helpers from v16.6 unchanged)
+# extract_series, analyze_trend, forecast_linear_ols, detect_forecast_intent, run_full_analysis_pipeline, etc.
 
 def scrub_schema_mentions(text: str) -> str:
     if not text: return text
@@ -176,7 +176,11 @@ def ask(q: Question, x_app_key: str = Header(...)):
         result = agent.invoke({"input": q.query}, return_intermediate_steps=True)
         sql_query = extract_sql_from_steps(result.get("intermediate_steps", []))
 
-        # Retry logic if first attempt failed
+        # Fallback: sometimes SQL ends up in `output`
+        if not sql_query and "output" in result and "SELECT" in str(result["output"]).upper():
+            sql_query = result["output"]
+
+        # Retry only if still no SQL
         if not sql_query:
             logger.warning("Agent failed to generate SQL. Retrying with stricter prompt...")
             strict_agent = create_sql_agent(
@@ -208,7 +212,7 @@ def ask(q: Question, x_app_key: str = Header(...)):
                 df = coerce_dataframe(rows, columns)
                 computed, unit = run_full_analysis_pipeline(df, q.query)
 
-                # Forecast integration (unchanged from v16.5)
+                # Forecast integration
                 do_forecast, target_dt = detect_forecast_intent(q.query)
                 if do_forecast:
                     candidate_cols = [c for c in df.columns if c.lower() in ("p_bal_gel", "p_bal", "balancing_price", "price")]
