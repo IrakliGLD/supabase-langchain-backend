@@ -17,19 +17,21 @@ from langchain_community.utilities import SQLDatabase
 from langchain.agents import create_sql_agent
 from langchain.agents.agent_toolkits import SQLDatabaseToolkit
 from langchain_core.agents import AgentAction
-from langchain_core.tools import Tool
 
 from dotenv import load_dotenv
 from decimal import Decimal
 import numpy as np
 import pandas as pd
 import statsmodels.api as sm
-from statsmodels.tsa.arima.model import ARIMA
 
-# Assumes context.py contains your DB_SCHEMA_DOC string
-from context import DB_SCHEMA_DOC
+# --- Configuration & Setup ---
 
-# ---------------- Logging & Env ----------------
+# Assumes context.py exists and contains: DB_SCHEMA_DOC = """...your schema..."""
+try:
+    from context import DB_SCHEMA_DOC
+except ImportError:
+    DB_SCHEMA_DOC = "Schema documentation is not available."
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("enerbot")
 
@@ -37,12 +39,11 @@ load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 SUPABASE_DB_URL = os.getenv("SUPABASE_DB_URL")
 APP_SECRET_KEY = os.getenv("APP_SECRET_KEY")
-ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "*")
 
-if not OPENAI_API_KEY or not SUPABASE_DB_URL or not APP_SECRET_KEY:
-    raise RuntimeError("Missing essential environment variables.")
+if not all([OPENAI_API_KEY, SUPABASE_DB_URL, APP_SECRET_KEY]):
+    raise RuntimeError("One or more essential environment variables are missing.")
 
-# ---------------- Database & Join Knowledge ----------------
+# --- Database & Join Knowledge Graph ---
 ALLOWED_TABLES = ["energy_balance_long", "entities", "monthly_cpi", "price", "tariff_gen", "tech_quantity", "trade"]
 DB_JOINS = {
     "energy_balance_long": {"join_on": "date", "related_to": ["price", "trade"]},
@@ -50,38 +51,41 @@ DB_JOINS = {
     "trade": {"join_on": "date", "related_to": ["energy_balance_long"]},
 }
 
-engine = create_engine(SUPABASE_DB_URL, poolclass=QueuePool, pool_size=10, max_overflow=20, pool_pre_ping=True, pool_recycle=3600)
+engine = create_engine(SUPABASE_DB_URL, poolclass=QueuePool, pool_size=10, pool_pre_ping=True)
 db = SQLDatabase(engine, include_tables=ALLOWED_TABLES)
 
-# ---------------- FastAPI App Initialization ----------------
-app = FastAPI(title="EnerBot Backend", version="7.1-final-working")
+# --- FastAPI Application ---
+app = FastAPI(title="EnerBot Backend", version="10.0-final-complete")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
-# ---------------- System Prompt ----------------
-SYSTEM_PROMPT = f"""
+# --- System Prompts ---
+SQL_GENERATOR_PROMPT = f"""
 ### ROLE ###
-You are EnerBot, an expert Georgian electricity market analyst. Your sole purpose is to answer user questions by querying a database and providing clear, data-driven analysis.
+You are an expert SQL writer. Your sole purpose is to generate a single, syntactically correct SQL query to answer the user's question based on the provided database schema and join information.
 
 ### MANDATORY RULES ###
-1.  **NEVER GUESS.** Use ONLY the data returned from the database.
-2.  **NEVER REVEAL INTERNALS.** Do not mention SQL, schema, table/column names, or the database in your final answer.
-3.  **ALWAYS ANALYZE, NEVER DUMP.** Your final output must be a narrative analysis including trends, peaks, lows, and seasonality. Conclude with a single key insight.
-4.  **BE RESILIENT.** If an initial query returns no data, re-examine the schema for alternative column names or synonyms (e.g., HPP -> hydro) and try a different query before concluding no data exists.
+1.  **GENERATE ONLY SQL.** Your final output must be only the SQL query.
+2.  Use the `DB_JOINS` dictionary to determine how to join tables.
+3.  For any time-series analysis, your query must cover the entire date range requested.
 
-### CAPABILITIES & SCHEMA INFO ###
-- You must interpret user terminology (e.g., TPP -> thermal).
-- You MUST use the provided `DB_JOINS` dictionary to determine how to join tables.
-- Key datasets: Generation (`tech_quantity`), Consumption (`energy_balance_long`), Prices (`price`), Trade (`trade`).
-
-### INTERNAL SCHEMA (for your reference only) ###
+### INTERNAL SCHEMA & JOIN KNOWLEDGE ###
 {DB_SCHEMA_DOC}
 DB_JOINS = {DB_JOINS}
 """
 
-# ---------------- Pydantic Models ----------------
+ANALYST_PROMPT = """
+You are an expert energy market analyst. Your task is to write a clear, concise narrative based *only* on the structured data provided to you.
+
+### MANDATORY RULES ###
+1.  **NEVER GUESS.** Use ONLY the numbers and facts provided in the "Computed Stats" section.
+2.  **NEVER REVEAL INTERNALS.** Do not mention the database, SQL, or technical jargon.
+3.  **ALWAYS BE AN ANALYST.** Your response must be a narrative including trends, peaks, lows, and seasonality.
+4.  **CONCLUDE SUCCINCTLY.** End with a single, short "Key Insight" line.
+"""
+
+# --- Pydantic Models for API ---
 class Question(BaseModel):
     query: str = Field(..., max_length=2000)
-    user_id: Optional[str] = None
     @validator("query")
     def validate_query(cls, v):
         if not v.strip(): raise ValueError("Query cannot be empty")
@@ -91,27 +95,32 @@ class APIResponse(BaseModel):
     answer: str
     execution_time: Optional[float] = None
 
-# ---------------- Security, Sanitization & Analytics Helpers ----------------
-def scrub_schema_mentions(text: str) -> str:
-    if not text: return text
-    for t in ALLOWED_TABLES:
-        text = re.sub(rf"\b{re.escape(t)}\b", "the database", text, flags=re.IGNORECASE)
-    text = re.sub(r"\b(schema|table|column|sql|join|primary key|foreign key|view|constraint)\b", "data", text, flags=re.IGNORECASE)
-    return text.replace("```", "").strip()
+# --- Core Helper & Analytics Functions (Full Implementation) ---
 
-def clean_sql(sql: str) -> str:
-    if not sql: return sql
-    sql = re.sub(r"```(?:sql)?\s*|\s*```", "", sql, flags=re.IGNORECASE)
-    sql = re.sub(r"--.*?$", "", sql, flags=re.MULTILINE)
-    sql = re.sub(r"\bLIMIT\s+\d+\b", "", sql, flags=re.IGNORECASE)
-    return sql.strip().removesuffix(";")
-
-def validate_sql_is_safe(sql: str) -> None:
-    up = sql.upper()
-    if not up.startswith("SELECT"): raise ValueError("Only SELECT statements are allowed.")
-    if any(f in up for f in ["INSERT", "UPDATE", "DELETE", "DROP", "CREATE", "ALTER"]):
+def clean_and_validate_sql(sql: str) -> str:
+    if not sql: raise ValueError("Generated SQL query is empty.")
+    cleaned_sql = re.sub(r"```(?:sql)?\s*|\s*```", "", sql, flags=re.IGNORECASE)
+    cleaned_sql = re.sub(r"--.*?$", "", cleaned_sql, flags=re.MULTILINE)
+    cleaned_sql = re.sub(r"\bLIMIT\s+\d+\b", "", cleaned_sql, flags=re.IGNORECASE)
+    cleaned_sql = cleaned_sql.strip().removesuffix(";")
+    if not cleaned_sql.strip().upper().startswith("SELECT"):
         raise ValueError("Only SELECT statements are allowed.")
-        
+    return cleaned_sql
+
+def extract_sql_from_steps(steps: List[Any]) -> Optional[str]:
+    for step in reversed(steps):
+        try:
+            action = step[0] if isinstance(step, tuple) else step
+            if isinstance(action, AgentAction):
+                tool_input = action.tool_input
+                if isinstance(tool_input, dict) and 'query' in tool_input:
+                    return tool_input['query']
+                if isinstance(tool_input, str) and "SELECT" in tool_input.upper():
+                    return tool_input
+        except Exception:
+            continue
+    return None
+
 def convert_decimal_to_float(obj):
     if isinstance(obj, Decimal): return float(obj)
     if isinstance(obj, list): return [convert_decimal_to_float(x) for x in obj]
@@ -119,120 +128,108 @@ def convert_decimal_to_float(obj):
     if isinstance(obj, dict): return {k: convert_decimal_to_float(v) for k, v in obj.items()}
     return obj
 
-def coerce_dataframe(rows: List[tuple]) -> pd.DataFrame:
+def coerce_dataframe(rows: List[tuple], columns: List[str]) -> pd.DataFrame:
     if not rows: return pd.DataFrame()
-    df = pd.DataFrame([list(r) for r in rows])
-    return df.map(convert_decimal_to_float)
+    df = pd.DataFrame(rows, columns=columns)
+    for col in df.columns:
+        # Attempt to convert object columns that might contain Decimals
+        if df[col].dtype == 'object':
+            df[col] = df[col].apply(convert_decimal_to_float)
+    return df
 
 def extract_series(df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
-    # ... (Your full, working implementation)
-    return {} # Placeholder for brevity, ensure your full code is here
+    out: Dict[str, pd.DataFrame] = {}
+    if df.empty: return out
+    
+    date_col_name = None
+    for c in df.columns:
+        try:
+            # Check if a column can be converted to datetime
+            pd.to_datetime(df[c], errors='raise')
+            date_col_name = c
+            break
+        except (ValueError, TypeError):
+            continue
 
-def analyze_trend(ts: pd.DataFrame) -> Optional[Tuple[str, Optional[float]]]:
-    # ... (Your full, working implementation)
-    return None
+    if date_col_name:
+        df[date_col_name] = pd.to_datetime(df[date_col_name])
+        numeric_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+        cat_cols = [c for c in df.columns if c not in numeric_cols and c != date_col_name]
+        
+        if numeric_cols and cat_cols:
+            value_col = numeric_cols[0]
+            category_col = cat_cols[0]
+            for cat_val, group in df.groupby(category_col):
+                out[str(cat_val)] = group[[date_col_name, value_col]].rename(columns={date_col_name: "date", value_col: "value"}).sort_values("date").reset_index(drop=True)
+        elif numeric_cols:
+            value_col = numeric_cols[0]
+            out["series"] = df[[date_col_name, value_col]].rename(columns={date_col_name: "date", value_col: "value"}).sort_values("date").reset_index(drop=True)
+    elif len(df.columns) >= 2:
+        # Fallback for non-timeseries data (e.g., summary GROUP BY)
+        label_col, value_col = df.columns[0], df.columns[1]
+        out["categories"] = df[[label_col, value_col]].rename(columns={label_col: "label", value_col: "value"}).reset_index(drop=True)
+    return out
 
-def find_extremes(ts: pd.DataFrame) -> Tuple[Optional[Tuple[datetime, float]], Optional[Tuple[datetime, float]]]:
-    # ... (Your full, working implementation)
-    return None, None
+def analyze_trend(ts: pd.DataFrame) -> Optional[Tuple[str, float]]:
+    if ts.empty or len(ts) < 2: return None
+    first, last = ts["value"].iloc[0], ts["value"].iloc[-1]
+    direction = "increasing" if last > first else "decreasing" if last < first else "stable"
+    pct = ((last - first) / abs(first) * 100) if first != 0 else 0.0
+    return direction, round(pct, 1)
 
-def find_anomalies(ts: pd.DataFrame, threshold: float = 3.0) -> List[Tuple[datetime, float]]:
-    # ... (Your full, working implementation)
-    return []
+def find_extremes(ts: pd.DataFrame) -> Tuple[Optional[Dict], Optional[Dict]]:
+    if ts.empty or "date" not in ts.columns: return None, None
+    max_row = ts.loc[ts["value"].idxmax()]
+    min_row = ts.loc[ts["value"].idxmin()]
+    return (
+        {"date": max_row["date"].strftime('%Y-%m'), "value": round(max_row["value"], 1)},
+        {"date": min_row["date"].strftime('%Y-%m'), "value": round(min_row["value"], 1)}
+    )
 
 def compute_seasonality(ts: pd.DataFrame) -> Optional[Dict[str, Any]]:
-    # ... (Your full, working implementation)
-    return None
+    if len(ts) < 24 or "date" not in ts.columns: return None
+    try:
+        ts_monthly = ts.set_index('date')['value'].asfreq('MS', method='ffill')
+        decomp = sm.tsa.seasonal_decompose(ts_monthly.dropna(), model="additive", period=12)
+        seasonal_profile = decomp.seasonal.groupby(decomp.seasonal.index.month).mean()
+        peak_month = datetime(2000, seasonal_profile.idxmax(), 1).strftime('%B')
+        trough_month = datetime(2000, seasonal_profile.idxmin(), 1).strftime('%B')
+        return {"peak_season": peak_month, "trough_season": trough_month}
+    except Exception as e:
+        logger.warning(f"Seasonality decomposition failed: {e}")
+        return None
 
-def forecast_arima(ts: pd.DataFrame, steps: int = 12) -> Optional[Dict[str, float]]:
-    # ... (Your full, working implementation)
-    return None
+def infer_unit_from_query(query: str) -> str:
+    q = query.lower()
+    if any(w in q for w in ["price", "tariff", "cost"]): return "GEL"
+    if any(w in q for w in ["generation", "consumption", "energy", "trade"]): return "TJ"
+    if any(w in q for w in ["capacity", "power"]): return "MW"
+    return "units"
 
-def contains_future_intent(q: str) -> bool:
-    ql = q.lower()
-    return any(w in ql for w in ["forecast", "predict", "expected", "future", "projection", "2030", "2035"])
-    
-def infer_unit_from_query(query: str) -> Optional[str]:
-    # ... (Your full, working implementation)
-    return "GEL"
-    
-def llm_analyst_answer(llm: ChatOpenAI, user_query: str, unit: Optional[str], series_dict: Dict[str, pd.DataFrame], computed: Dict[str, Any], seasonality_info: Dict[str, Optional[Dict[str, Any]]]) -> str:
-    ANALYST_SYSTEM = "You are an energy market analyst..." # (Full prompt)
-    prompt = f"User query: {user_query}..." # (Full prompt building logic)
-    msg = llm.invoke([{"role": "system", "content": ANALYST_SYSTEM}, {"role": "user", "content": prompt}])
-    return getattr(msg, "content", str(msg)).strip()
-
-def extract_sql_from_steps(steps: List[Any]) -> Optional[str]:
-    if not steps: return None
-    for step in reversed(steps):
-        try:
-            action = step[0] if isinstance(step, tuple) else step
-            action_dict = action.dict() if isinstance(action, AgentAction) else action
-            tool_input = action_dict.get("tool_input", {})
-            if isinstance(tool_input, dict) and 'query' in tool_input:
-                return tool_input['query']
-            if isinstance(tool_input, str) and tool_input.strip().upper().startswith("SELECT"):
-                return tool_input
-        except Exception:
-            continue
-    return None
-
-# ---------------- Core Logic Function (FULLY IMPLEMENTED) ----------------
-def process_and_analyze_data(sql: str, user_query: str, analyst_llm: ChatOpenAI) -> str:
-    """Executes SQL, runs the FULL Python analytics pipeline, and generates the final narrative."""
-    clean_query = clean_sql(sql)
-    validate_sql_is_safe(clean_query)
-
-    with engine.connect() as conn:
-        rows = conn.execute(text(clean_query)).fetchall()
-
-    if not rows:
-        return scrub_schema_mentions("I don't have data for that specific request.")
-
-    df = coerce_dataframe(rows)
+def run_full_analysis_pipeline(df: pd.DataFrame, user_query: str) -> Tuple[Dict, Dict, str]:
+    logger.info("Running full Python analysis pipeline...")
     series_dict = extract_series(df)
-    if not series_dict:
-        return "The data retrieved could not be structured for analysis."
-
-    unit = infer_unit_from_query(user_query)
-    computed: Dict[str, Any] = {}
-    seasonality_info: Dict[str, Optional[Dict[str, Any]]] = {}
-
+    computed = {}
     for name, s in series_dict.items():
         if "date" in s.columns and not s.empty:
-            tr = analyze_trend(s)
-            if tr:
-                direction, pct = tr
-                computed[f"{name}_trend"] = f"{direction} ({pct:+.1f}%)" if pct is not None else direction
-            mx, mn = find_extremes(s)
-            if mx: computed[f"{name}_peak"] = f"{mx[0].strftime('%Y-%m')}: {round(mx[1],1)}"
-            if mn: computed[f"{name}_low"] = f"{mn[0].strftime('%Y-%m')}: {round(mn[1],1)}"
-            anomalies = find_anomalies(s)
-            if anomalies: computed[f"{name}_anomalies"] = [f"{d.strftime('%Y-%m')}: {round(v,1)}" for d, v in anomalies]
-            si = compute_seasonality(s)
-            if si: seasonality_info[name] = si
-            if contains_future_intent(user_query):
-                pred = forecast_arima(s)
-                if pred: computed[f"{name}_forecast"] = pred
-        elif not s.empty:
-            total = float(s["value"].sum())
-            computed[f"{name}_total"] = round(total, 1)
-            top_row = s.sort_values("value", ascending=False).iloc[0]
-            share = (float(top_row["value"]) / total * 100) if total > 0 else 0
-            computed[f"{name}_top"] = f"{str(top_row['label'])}: {round(float(top_row['value']),1)} ({share:.1f}% share)"
+            if trend := analyze_trend(s): computed[f"{name} Trend"] = f"{trend[0]} ({trend[1]:+g}%)"
+            peak, low = find_extremes(s)
+            if peak: computed[f"{name} Peak"] = peak
+            if low: computed[f"{name} Low"] = low
+            if seasonality := compute_seasonality(s): computed[f"{name} Seasonality"] = seasonality
+    unit = infer_unit_from_query(user_query)
+    return computed, unit
 
-    final_text = llm_analyst_answer(analyst_llm, user_query, unit, series_dict, computed, seasonality_info)
-    
-    if not final_text.strip():
-        return "A numeric summary is available, but a narrative could not be generated."
+def generate_final_narrative(llm: ChatOpenAI, user_query: str, unit: str, computed: Dict) -> str:
+    stats_str = "\n- ".join([f"{k}: {v}" for k, v in computed.items()])
+    prompt = f"User query: {user_query}\nUnit: {unit}\nComputed Stats:\n- {stats_str}"
+    msg = llm.invoke([{"role": "system", "content": ANALYST_PROMPT}, {"role": "user", "content": prompt}])
+    return getattr(msg, "content", "Could not generate a narrative.").strip()
 
-    return scrub_schema_mentions(final_text)
-
-# ---------------- API Endpoint ----------------
+# --- API Endpoint ---
 @app.get("/healthz")
 def health():
-    with engine.connect() as conn: conn.execute(text("SELECT 1"))
-    return {"ok": True, "ts": datetime.utcnow()}
+    return {"status": "ok"}
 
 @app.post("/ask", response_model=APIResponse)
 def ask(q: Question, x_app_key: str = Header(...)):
@@ -241,49 +238,36 @@ def ask(q: Question, x_app_key: str = Header(...)):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
     try:
-        llm = ChatOpenAI(model="gpt-4o", temperature=0, openai_api_key=OPENAI_API_KEY, request_timeout=60)
+        llm = ChatOpenAI(model="gpt-4o", temperature=0, openai_api_key=OPENAI_API_KEY)
         toolkit = SQLDatabaseToolkit(db=db, llm=llm)
-        all_tools = toolkit.get_tools()
+        agent = create_sql_agent(llm=llm, toolkit=toolkit, verbose=True, agent_type="openai-tools", system_message=SQL_GENERATOR_PROMPT)
 
-        original_sql_tool = next((tool for tool in all_tools if tool.name == "sql_db_query"), None)
-        
-        final_tools = all_tools
-        if original_sql_tool:
-            def wrapped_sql_run_func(query: str):
-                logger.info(f"WRAPPED TOOL: Intercepted query: {query}")
-                cleaned_query = clean_sql(query)
-                validate_sql_is_safe(cleaned_query)
-                return original_sql_tool.run(cleaned_query)
-
-            wrapped_tool = Tool(
-                name="sql_db_query",
-                func=wrapped_sql_run_func,
-                description=original_sql_tool.description
-            )
-            final_tools = [wrapped_tool if tool.name == "sql_db_query" else tool for tool in all_tools]
-
-        agent = create_sql_agent(
-            llm=llm,
-            toolkit=toolkit,
-            tools=final_tools,
-            verbose=True,
-            agent_type="openai-tools",
-            system_message=SYSTEM_PROMPT,
-            max_iterations=8,
-            early_stopping_method="generate",
-        )
-
+        logger.info("Invoking agent to generate SQL...")
         result = agent.invoke({"input": q.query}, return_intermediate_steps=True)
-        sql = extract_sql_from_steps(result.get("intermediate_steps", []))
+        
+        sql_query = extract_sql_from_steps(result.get("intermediate_steps", []))
 
-        if not sql:
-            logger.warning("No SQL extracted, falling back to agent's raw output.")
-            final_answer = scrub_schema_mentions(result.get("output", "I could not determine how to answer that question."))
+        if not sql_query:
+            logger.warning("Agent failed to generate SQL. Falling back to its text response.")
+            final_answer = result.get("output", "I could not generate a query for that question.")
         else:
-            final_answer = process_and_analyze_data(sql, q.query, llm)
+            logger.info(f"SQL extracted: {sql_query}")
+            safe_sql = clean_and_validate_sql(sql_query)
+            
+            with engine.connect() as conn:
+                cursor_result = conn.execute(text(safe_sql))
+                rows = cursor_result.fetchall()
+                columns = list(cursor_result.keys())
+
+            if not rows:
+                final_answer = "Based on the available data, I couldn't find any information for your specific request."
+            else:
+                df = coerce_dataframe(rows, columns)
+                computed, unit = run_full_analysis_pipeline(df, q.query)
+                final_answer = generate_final_narrative(llm, q.query, unit, computed)
         
         return APIResponse(answer=final_answer, execution_time=round(time.time() - start_time, 2))
 
     except Exception as e:
-        logger.error(f"Processing error in /ask endpoint: {e}", exc_info=True)
+        logger.error(f"FATAL error in /ask endpoint: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="An internal processing error occurred.")
