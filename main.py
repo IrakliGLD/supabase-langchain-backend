@@ -193,7 +193,7 @@ def extract_series(df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
     date_col_name = next((c for c in df.columns if pd.api.types.is_datetime64_any_dtype(pd.to_datetime(df[c], errors='coerce'))), None)
     if date_col_name:
         df[date_col_name] = pd.to_datetime(df[date_col_name])
-        numeric_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+        numeric_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])] 
         cat_cols = [c for c in df.columns if c not in numeric_cols and c != date_col_name]
         if numeric_cols and cat_cols:
             value_col, category_col = numeric_cols[0], cat_cols[0]
@@ -280,13 +280,22 @@ def ask(q: Question, x_app_key: str = Header(...)):
     try:
         llm = ChatOpenAI(model="gpt-4o", temperature=0, openai_api_key=OPENAI_API_KEY)
         toolkit = SQLDatabaseToolkit(db=db, llm=llm)
-        agent = create_sql_agent(llm=llm, toolkit=toolkit, verbose=True, agent_type="openai-tools", system_message=SQL_GENERATOR_PROMPT)
+
+        # >>> Change applied here: raise the agent's row-fetch window to 1000 <<<
+        agent = create_sql_agent(
+            llm=llm,
+            toolkit=toolkit,
+            verbose=True,
+            agent_type="openai-tools",           # kept as-is to avoid breaking prompt wiring
+            system_message=SQL_GENERATOR_PROMPT, # kept as-is from your version
+            top_k=1000                           # <-- this is the important change
+        )
 
         logger.info("Step 1: Invoking agent to generate SQL.")
         result = agent.invoke({"input": q.query}, return_intermediate_steps=True)
-        
+
         sql_query = extract_sql_from_steps(result.get("intermediate_steps", []))
-        
+
         if not sql_query:
             logger.warning("Agent failed to generate a SQL query. Using its text response as a fallback.")
             final_answer = result.get("output", "I was unable to formulate a query to answer the question.")
@@ -294,7 +303,7 @@ def ask(q: Question, x_app_key: str = Header(...)):
             logger.info(f"Step 2: SQL extracted: {sql_query}")
             safe_sql = clean_and_validate_sql(sql_query)
             logger.info(f"Step 3: Executing cleaned SQL for full data retrieval: {safe_sql}")
-            
+
             with engine.connect() as conn:
                 cursor_result = conn.execute(text(safe_sql))
                 rows = cursor_result.fetchall()
@@ -308,7 +317,7 @@ def ask(q: Question, x_app_key: str = Header(...)):
                 df = coerce_dataframe(rows, columns)
                 computed, unit = run_full_analysis_pipeline(df, q.query)
                 final_answer = generate_final_narrative(llm, q.query, unit, computed)
-        
+
         return APIResponse(answer=scrub_schema_mentions(final_answer), execution_time=round(time.time() - start_time, 2))
 
     except Exception as e:
