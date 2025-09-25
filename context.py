@@ -1,4 +1,4 @@
-# === context.py v1.2-final ===
+# === context.py v1.3 ===
 # Holds schema documentation and join rules
 
 DB_SCHEMA_DOC = """
@@ -89,11 +89,25 @@ Market outcomes.
 **Columns:**
 - `date`: Month.
 - `entity`: Plant name (join with entities.entity).
-- `segment`: Market segment (balancing, bilateral & exchange).
+- `segment`: Market segment (balancing, bilateral, exchange, thermal_ppa, renewable_ppa).
 - `quantity`: Thousand MWh.
 
+**Key Synonyms for `segment`:**
+- "balancing electricity", "balancing market" → `segment = 'balancing'`
+- "bilateral contracts", "direct contracts" → `segment = 'bilateral'`
+- "exchange market", "market platform" → `segment = 'exchange'`
+- "thermal PPA", "conventional PPA" → `segment = 'thermal_ppa'`
+- "renewable PPA", "RES PPA", "green PPA" → `segment = 'renewable_ppa'`
+
+**Important Analytical Logic:**
+- To compute the **share of renewable PPA in balancing electricity**:
+  1. Aggregate `quantity` where `segment = 'renewable_ppa'`.
+  2. Divide by total `quantity` where `segment = 'balancing'` for the same period.
+- To study **PPA participation**: compare `thermal_ppa + renewable_ppa` against total balancing volumes.
+- To study **market split**: compare shares of `bilateral`, `exchange`, `balancing`, and `PPA`.
+
 **Notes:**
-- Bilateral + exchange summed together.
+- Bilateral and exchange are currently summed together in some official stats.
 - PPAs (thermal_ppa, renewable_ppa) must sell to ESCO during mandatory periods.
 
 ---
@@ -116,7 +130,7 @@ Market outcomes.
 - **Entities ↔ Price**: Indirect via trade: entities → trade → price.
 """
 
-# --- DB_JOINS v1.2-final ---
+# --- DB_JOINS v1.3 ---
 DB_JOINS = {
     "dates": {"join_on": "date", "related_to": ["price", "monthly_cpi", "tech_quantity", "trade", "tariff_gen"]},
     "energy_balance_long": {"join_on": "year", "related_to": ["tech_quantity", "price", "monthly_cpi", "trade"]},
