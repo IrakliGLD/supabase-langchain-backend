@@ -1,86 +1,110 @@
 DB_SCHEMA_DOC = """
-General Rules for the Assistant:
-• You are NOT allowed to return or export full tables, rows, or detailed datasets from the database.
-• You may only provide summaries, insights, comparisons, and explanations based on the data.
-• If a user asks for raw data dumps, you must refuse and instead suggest insights or aggregated views.
+### Global Rules & Conversions ###
+- **General Rule:** You must only provide summaries and insights. You are NOT allowed to return raw data, full tables, or detailed row-level datasets. If a user asks for a data dump, you must refuse and suggest an aggregated view instead.
+- **Unit Conversion:** To compare data between tables, use these exact factors:
+  - 1 TJ = 277.778 MWh
+  - The `tech_quantity` and `trade` tables are in "thousand MWh". To compare with a value in MWh, multiply their `quantity` values by 1000.
 
-General Remarks:
-• Volume in “Table: public.energy_balance_long” is measured in TJ.
-• Quantities in all other tables/views are in “thousand MWH”
-• Prices are either in GEL/MWH, or USD/MWH
+---
+### Table: public.energy_balance_long ###
+Shows the energy consumption of different sectors, based on GEOSTAT data.
 
-Table: public.energy_balance_long
-The table show the energy consumption of the different sectors. Yearly data is based on the National Energy Balances provided by the National Statistics Office – GEOSTAT.
-• year: calendar year.
-• sector: The sectors which consume energy -  
-  A) Industry (or industry sector) which include: Iron and steel; Chemical (including petrochemical); Non-metallic minerals; Mining and quarrying; Food, beverages and tobacco; Construction; Other Industry  
-  B) Transport (or transport sector), which include: Road; Rail; Pipeline transport; Other Transport.  
-  C) Other use, which include: Commercial and public services; Residential; Other.
-• energy_source: different energy sources consumed in Georgia. There are specific sources (Coal, Crude Oil, Oil products, Natural Gas, Nuclear, Hydro, Geothermal, wind, solar etc; Biofuel & Waste; Electricity; Heat) and “Total” is a sum of all energy sources. 
-• volume_tj: energy consumption measured in TJ.
+**Columns (Explicit Mapping):**
+- `year`: The calendar year of the record.
+- `sector`: The energy-consuming sector.
+  - `Industry`: Includes Iron and steel, Chemical, Non-metallic minerals, Mining, Food/beverages, Construction.
+  - `Transport`: Includes Road, Rail, Pipeline transport.
+  - `Other use`: Includes Commercial/public services, Residential.
+- `energy_source`: The type of energy consumed (e.g., Coal, Oil products, Natural Gas, Hydro, Wind, Solar, Biofuel & Waste, Electricity, Heat). "Total" is the sum of all sources.
+- `volume_tj`: Energy consumption measured in **TJ**.
 
-Table: public.entities
-This table just show the entities for which the information is shown in other view and tables. Cover the entities in electricity sector.
-• entity: name of the entity.
-• entity_normalized: normalized unique identifier. Some entities are called different names. For analyses, always use entity_normalized instead of entity because names may vary.
-• type: entity classification (HPP, TPP, Import, Export, Solar, Wind).
-• ownership: owner of the entity.
-• source: shows whether the entity is local – locally produced hydro or wind, or it is import_dependent – directly import or gas import dependent thermal power plants.
+---
+### Table: public.entities ###
+Defines the entities in the electricity sector.
 
-Table: public.monthly_cpi
-The consumer price index (CPI) is calculated by the National Statistics Office – GEOSTAT. It shows CPI indexed to 2015 = 100 (base year). The aim is to compare energy CPI with Overall CPI and CPI of some specific goods. In period dec2020-feb2021 we see big drop in electricity_gas_and_other_fuels CPI, due to energy subsidies provided to Georgian households.
-• date: monthly timestamp
-• cpi_type: overall CPI, electricity_gas_and_other_fuels and other specific goods.
-• cpi: consumer price index (numeric).
+**Columns (Explicit Mapping):**
+- `entity`: The common name of the entity.
+- `entity_normalized`: The unique, standardized identifier for an entity. **Always use this column for analysis and joins**, as `entity` names can vary.
+- `type`: The classification of the entity.
+- `ownership`: The owner of the entity.
+- `source`: Indicates if the entity is local (`local`) or dependent on imports (`import_dependent`).
 
-Table: public.price
-• date: monthly timestamp
-• p_dereg_gel – price (GEL/MWH) deregulated power plants (all hydro at the moment) receive when selling as balancing electricity (unsold bilaterally or on exchange from July 2024).
-• p_dereg_usd – the same as p_dereg_gel but in USD/MWH (derived by dividing p_dereg_gel by xrate).
-• p_bal_gel – Balancing electricity price (GEL/MWH). Weighted average of all balancing sales. PPAs (thermal_ppa, renewable_ppa from `public.trade`) must sell as balancing during mandatory purchase periods (8–12 months). In practice, usually the most expensive sources sell here, though occasionally cheap regulated/deregulated HPPs appear (esp. Apr–Jun).
-• p_bal_usd – the same as p_bal_gel but in USD/MWH (derived as p_bal_gel / xrate).
-• p_gcap_gel – guaranteed capacity fee/charge (GEL/MWH). Paid by all final consumers and exporters to cover fixed costs of guaranteed capacity TPPs. Not paid by Abkhazia (occupied territory). Calculated as fixed monthly fee / (total consumption – Abkhazia – exports).
-• p_gcap_usd – same as p_gcap_gel but in USD/MWH (derived as p_gcap_gel / xrate).
-• xrate – Exchange rate GEL/USD.
+**Key Synonyms for `type` column:**
+- User says "HPP", "hydro plant" -> Query for `type = 'HPP'`
+- User says "TPP", "thermal plant" -> Query for `type = 'TPP'`
+- User says "Solar plant" -> Query for `type = 'Solar'`
+- User says "Wind plant" -> Query for `type = 'Wind'`
 
-Table: public.tariff_gen
-The table show the tariffs of the power plant approved by the national energy regulator – GNERC.  
-For thermals: if tariff is missing in a month, it means no generation → no tariff (variable cost only, fixed covered by gcap).  
-For hydros: if tariff is missing from a given month, the HPP was deregulated and no longer subject to tariff approval.
-• date: monthly timestamp
-• entity: generating unit.
-• tariff_gel: regulated tariff in GEL/MWh.
-• tariff_usd: regulated tariff in USD/MWh.
+---
+### Table: public.monthly_cpi ###
+Shows the monthly Consumer Price Index (CPI), indexed to 2015=100.
 
-Table: public.tech_quantity
-Covers the demand and supply sides.
-Demand side:
-• abkhazeti: "Abkhazeti"
-• supply_distribution: "Supplier/Distributor"
-• direct_customers: "Direct Consumers"
-• self_cons: "Self-Consumption by PP"
-• losses: "Losses"
-• export: "Export"
-Supply side:
-• hydro: "Hydro Generation"
-• thermal: "Thermal Generation"
-• wind: "Wind Generation"
-• import: "Import"
-Transit:
-• transit: electricity transiting (Russia/Azerbaijan → Turkey). Increased 2022–2023 due to high gas prices in Turkey (Russia–Ukraine crisis).
-Columns:
-• date: monthly timestamp
-• type_tech: demand, supply, or transit category
-• quantity_tech: electricity quantity (1000 MWh).
+**Columns (Explicit Mapping):**
+- `date`: The month of the record. if you need to aggregate by month or year, use the date as it also contains information about the month and year.
+- `cpi_type`: The category of the index (e.g., `overall CPI`, `electricity_gas_and_other_fuels`).
+- `cpi`: The numeric CPI value.
+- **Note:** A large drop in `electricity_gas_and_other_fuels` CPI occurred between Dec 2020 and Feb 2021 due to government subsidies.
 
-Table: public.trade
-Shows electricity trade outcomes.  
-Unlike `tech_quantity`, which shows totals, this is broken down by trade.  
-Electricity may be sold bilaterally or on the exchange (introduced July 2024). Any remaining goes to balancing.  
-⚠ Note: bilateral and exchange trades are not separated in this data — only the sum is shown.  
-Thermal_ppa and renewable_ppa cannot sell bilaterally or on exchange during mandatory sale period; all their generation goes to ESCO. Outside this period, PPAs may sell across all markets.
-• date: monthly timestamp
-• entity: the source (plant, import, or aggregation).
-• segment: market segment (day-ahead, balancing, bilateral, etc.).
-• quantity: traded energy (1000 MWh).
+---
+### Table: public.price ###
+Contains monthly electricity market prices.
+
+**Columns (Explicit Mapping):**
+- `date`: The month of the record. if you need to aggregate by month or year, use the date as it also contains information about the month and year.
+- `p_dereg_gel`: Price (GEL/MWH) for deregulated power plants selling as balancing electricity.
+- `p_bal_gel`: **Balancing electricity price** (GEL/MWH). This is the weighted average price of all balancing sales and a key market indicator.
+- `p_gcap_gel`: Guaranteed capacity fee (GEL/MWH) paid by consumers to cover fixed costs of essential thermal power plants.
+- `xrate`: The GEL to USD exchange rate.
+- `p_dereg_usd`, `p_bal_usd`, `p_gcap_usd`: The USD equivalents of the GEL prices.
+
+---
+### Table: public.tariff_gen ###
+Shows the regulated tariffs for power plants, approved by GNERC.
+
+**Columns (Explicit Mapping):**
+- `date`: The month of the record. if you need to aggregate by month or year, use the date as it also contains information about the month and year.
+- `entity`: The name of the generating unit.
+- `tariff_gel`: The regulated tariff in GEL/MWh.
+- `tariff_usd`: The regulated tariff in USD/MWh.
+
+**Crucial Logic:**
+- **For thermal plants:** A missing tariff in a given month means the plant did not generate electricity.
+- **For hydro plants:** A missing tariff from a given month onwards means the plant was deregulated from that point on.
+
+---
+### Table: public.tech_quantity ###
+Covers total electricity demand and supply side quantities.
+
+**Columns (Explicit Mapping):**
+- `date`: The month of the record. if you need to aggregate by month or year, use the date as it also contains information about the month and year.
+- `type_tech`: The category of supply, demand, or transit.
+- `quantity_tech`: The amount of electricity in **thousand MWh**.
+
+**Key Synonyms for `type_tech` column:**
+- User says "hydro generation", "hydro power", "HPP" -> Query for `type_tech = 'hydro'`
+- User says "thermal generation", "thermal power", "TPP" -> Query for `type_tech = 'thermal'`
+- User says "wind generation", "wind power plant", "wind turbine" -> Query for `type_tech = 'wind'`
+- User says "solar generation" -> There is no 'solar' type in this table; check other tables.
+- User says "exports" -> Query for `type_tech = 'export'`
+- User says "imports" -> Query for `type_tech = 'import'`
+- User says "losses" -> Query for `type_tech = 'losses'`
+- User says "Abkhazeti consumption" -> Query for `type_tech = 'abkhazeti'`
+- User says "transit" -> Query for `type_tech = 'transit'` (Note: Transit increased in 2022-2023 due to high gas prices in Turkey).
+
+---
+### Table: public.trade ###
+Shows electricity trade outcomes broken down by entity and market segment.
+
+**Columns (Explicit Mapping):**
+- `date`: The month of the record. if you need to aggregate by month or year, use the date as it also contains information about the month and year.
+- `entity`: The source of electricity selling it.
+- `segment`: The market segment.
+- `quantity`: The traded energy amount in **thousand MWh**.
+
+**Important Notes:**
+- Bilateral and exchange trades are currently summed together.
+- `thermal_ppa` and `renewable_ppa` entities must sell all their generation to ESCO during mandatory periods and cannot trade bilaterally.
+
+### Data Granularity & Timeframes ###
+- **Granularity:** All tables with a `date` column contain **monthly** data. The date typically represents the first day of the month. The data is NOT available at a daily or weekly level.
 """
