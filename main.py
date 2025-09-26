@@ -1,4 +1,4 @@
-import os
+import os 
 import re
 import logging
 import time
@@ -48,7 +48,7 @@ engine = create_engine(SUPABASE_DB_URL, poolclass=QueuePool, pool_size=10, pool_
 db = SQLDatabase(engine, include_tables=ALLOWED_TABLES)
 
 # --- FastAPI Application ---
-app = FastAPI(title="EnerBot Backend", version="16.7-sql-fix")
+app = FastAPI(title="EnerBot Backend", version="16.10-sql-fallback")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 # --- System Prompts ---
@@ -122,7 +122,27 @@ def extract_sql_from_steps(steps: List[Any]) -> Optional[str]:
                     sql_query = tool_input['query']
                 elif isinstance(tool_input, str):
                     sql_query = tool_input
+
+    # --- Regex fallback ---
+    try:
+        combined = " ".join(str(s) for s in steps)
+        m = re.search(r"SELECT\s+[\s\S]*?;", combined, flags=re.IGNORECASE)
+        if m and not sql_query:
+            sql_query = m.group(0)
+    except Exception:
+        pass
+
     return sql_query
+
+def extract_sql_from_output(result: Dict[str, Any]) -> Optional[str]:
+    if "output" not in result:
+        return None
+    raw = str(result["output"])
+    raw_clean = re.sub(r"```(?:sql)?", "", raw, flags=re.IGNORECASE)
+    m2 = re.search(r"SELECT\s+[\s\S]*?;", raw_clean, flags=re.IGNORECASE)
+    if m2:
+        return m2.group(0)
+    return None
 
 def convert_decimal_to_float(obj):
     if isinstance(obj, Decimal): return float(obj)
@@ -138,16 +158,6 @@ def coerce_dataframe(rows: List[tuple], columns: List[str]) -> pd.DataFrame:
         if df[col].dtype == 'object':
             df[col] = df[col].apply(convert_decimal_to_float)
     return df
-
-# (keep forecasting + analysis helpers from v16.6 unchanged)
-# extract_series, analyze_trend, forecast_linear_ols, detect_forecast_intent, run_full_analysis_pipeline, etc.
-
-def scrub_schema_mentions(text: str) -> str:
-    if not text: return text
-    for t in ALLOWED_TABLES:
-        text = re.sub(rf"\b{re.escape(t)}\b", "the data", text, flags=re.IGNORECASE)
-    text = re.sub(r"\b(schema|table|column|sql|join|primary key|foreign key|view|constraint)\b", "data", text, flags=re.IGNORECASE)
-    return text.replace("```", "").strip()
 
 # --- API Endpoint ---
 @app.get("/healthz")
@@ -176,9 +186,9 @@ def ask(q: Question, x_app_key: str = Header(...)):
         result = agent.invoke({"input": q.query}, return_intermediate_steps=True)
         sql_query = extract_sql_from_steps(result.get("intermediate_steps", []))
 
-        # Fallback: sometimes SQL ends up in `output`
-        if not sql_query and "output" in result and "SELECT" in str(result["output"]).upper():
-            sql_query = result["output"]
+        # Fallback: also check "output" for SQL
+        if not sql_query:
+            sql_query = extract_sql_from_output(result)
 
         # Retry only if still no SQL
         if not sql_query:
@@ -193,6 +203,8 @@ def ask(q: Question, x_app_key: str = Header(...)):
             )
             result_retry = strict_agent.invoke({"input": q.query}, return_intermediate_steps=True)
             sql_query = extract_sql_from_steps(result_retry.get("intermediate_steps", []))
+            if not sql_query:
+                sql_query = extract_sql_from_output(result_retry)
 
         if not sql_query:
             logger.error("Both attempts failed to generate SQL. Falling back to text output.")
