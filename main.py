@@ -1,282 +1,278 @@
-import os
+# === context.py v1.4 ===
+# Unified schema doc + joins + human-friendly labels + scrubber
+
 import re
-import logging
-import time
-from datetime import datetime
-from typing import Optional, Dict, Any, List
 
-from fastapi import FastAPI, HTTPException, Header
-from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field, validator
-from sqlalchemy import create_engine, text
-from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy.pool import QueuePool
+# --- Column label mapping ---
+COLUMN_LABELS = {
+    # shared
+    "date": "Period (Year-Month)",
 
-from langchain_openai import ChatOpenAI
-from langchain_community.utilities import SQLDatabase
-from langchain.agents import create_sql_agent
-from langchain.agents.agent_toolkits import SQLDatabaseToolkit
-from langchain_core.agents import AgentAction
+    # energy_balance_long
+    "year": "Year",
+    "sector": "Sector",
+    "energy_source": "Energy Source",
+    "volume_tj": "Energy Consumption (TJ)",
 
-from dotenv import load_dotenv
-from decimal import Decimal
-import numpy as np
-import pandas as pd
-import statsmodels.api as sm
-from statsmodels.tsa.seasonal import STL
+    # entities
+    "entity": "Entity Name",
+    "entity_normalized": "Standardized Entity ID",
+    "type": "Entity Type",
+    "ownership": "Ownership",
+    "source": "Source (Local vs Import-Dependent)",
 
-# --- Configuration & Setup ---
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-logger = logging.getLogger("enerbot")
+    # monthly_cpi
+    "cpi_type": "CPI Category",
+    "cpi": "CPI Value (2015=100)",
 
-load_dotenv()
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-SUPABASE_DB_URL = os.getenv("SUPABASE_DB_URL")
-APP_SECRET_KEY = os.getenv("APP_SECRET_KEY")
+    # price
+    "p_dereg_gel": "Deregulated Price (GEL/MWh)",
+    "p_bal_gel": "Balancing Price (GEL/MWh)",
+    "p_gcap_gel": "Guaranteed Capacity Fee (GEL/MWh)",
+    "xrate": "Exchange Rate (GEL/USD)",
+    "p_dereg_usd": "Deregulated Price (USD/MWh)",
+    "p_bal_usd": "Balancing Price (USD/MWh)",
+    "p_gcap_usd": "Guaranteed Capacity Fee (USD/MWh)",
 
-if not all([OPENAI_API_KEY, SUPABASE_DB_URL, APP_SECRET_KEY]):
-    raise RuntimeError("One or more essential environment variables are missing.")
+    # tariff_gen
+    "tariff_gel": "Regulated Tariff (GEL/MWh)",
+    "tariff_usd": "Regulated Tariff (USD/MWh)",
 
-# --- Import DB Schema & Joins ---
-from context import DB_SCHEMA_DOC, DB_JOINS, scrub_schema_mentions
+    # tech_quantity
+    "type_tech": "Technology Type",
+    "quantity_tech": "Quantity (thousand MWh)",
 
-ALLOWED_TABLES = [
-    "energy_balance_long", "entities", "monthly_cpi",
-    "price", "tariff_gen", "tech_quantity", "trade", "dates"
-]
+    # trade
+    "segment": "Market Segment",
+    "quantity": "Trade Volume (thousand MWh)",
+}
 
-engine = create_engine(SUPABASE_DB_URL, poolclass=QueuePool, pool_size=10, pool_pre_ping=True)
-db = SQLDatabase(engine, include_tables=ALLOWED_TABLES)
+# --- Table label mapping ---
+TABLE_LABELS = {
+    "dates": "Calendar (Months)",
+    "energy_balance_long": "Energy Balance (by Sector)",
+    "entities": "Power Sector Entities",
+    "monthly_cpi": "Consumer Price Index (CPI)",
+    "price": "Electricity Market Prices",
+    "tariff_gen": "Regulated Tariffs",
+    "tech_quantity": "Generation & Demand Quantities",
+    "trade": "Electricity Trade",
+}
 
-# --- FastAPI Application ---
-app = FastAPI(title="EnerBot Backend", version="17.1-preload-agent")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
+# --- Value label mapping ---
+VALUE_LABELS = {
+    # tech_quantity.type_tech
+    "hydro": "Hydro Generation",
+    "thermal": "Thermal Generation",
+    "wind": "Wind Generation",
+    "solar": "Solar Generation",
+    "import": "Imports",
+    "export": "Exports",
+    "losses": "Grid Losses",
+    "abkhazeti": "Abkhazia Consumption",
+    "transit": "Transit Flows",
 
-# --- System Prompts ---
-SQL_GENERATOR_PROMPT = f"""
-### ROLE ###
-You are an expert SQL writer. Your sole purpose is to generate a single, syntactically correct SQL query 
-to answer the user's question based on the provided database schema and join information.
+    # entities.type
+    "HPP": "Hydropower Plant",
+    "TPP": "Thermal Power Plant",
+    "Solar": "Solar Plant",
+    "Wind": "Wind Plant",
+    "Import": "Import",
 
-### MANDATORY RULES ###
-1.  **GENERATE ONLY SQL.** Your final output must be only the SQL query.
-2.  Use the `DB_JOINS` dictionary to determine how to join tables.
-3.  For any time-series analysis, query for the entire date range requested, or the entire dataset if no range is specified.
+    # CPI categories
+    "overall CPI": "Overall Consumer Price Index",
+    "electricity_gas_and_other_fuels": "Electricity, Gas & Other Fuels CPI",
 
-### INTERNAL SCHEMA & JOIN KNOWLEDGE ###
-{DB_SCHEMA_DOC}
-DB_JOINS = {DB_JOINS}
+    # energy sources in energy_balance_long
+    "Coal": "Coal",
+    "Oil products": "Oil Products",
+    "Natural Gas": "Natural Gas",
+    "Hydro": "Hydropower",
+    "Wind": "Wind Power",
+    "Solar": "Solar Power",
+    "Biofuel & Waste": "Biofuel & Waste",
+    "Electricity": "Electricity",
+    "Heat": "Heat",
+    "Total": "Total Energy Use",
+
+    # trade.segment values
+    "balancing_electricity": "Balancing Electricity",
+    "bilateral_exchange": "Bilateral Contracts & Exchange",
+    "renewable_ppa": "Renewable PPA",
+    "thermal_ppa": "Thermal PPA",
+}
+
+# --- Human-friendly scrubber (labels-aware) ---
+def scrub_schema_mentions(text: str) -> str:
+    """
+    Cleans final model output so that:
+    - Raw SQL/schema terms are humanized.
+    - Column names -> user-friendly labels.
+    - Table names -> user-friendly labels.
+    - Encoded categorical values -> natural labels.
+    """
+    if not text:
+        return text
+
+    # 1) Columns -> labels
+    for col, label in COLUMN_LABELS.items():
+        text = re.sub(rf"\b{re.escape(col)}\b", label, text, flags=re.IGNORECASE)
+
+    # 2) Tables -> labels
+    for tbl, label in TABLE_LABELS.items():
+        text = re.sub(rf"\b{re.escape(tbl)}\b", label, text, flags=re.IGNORECASE)
+
+    # 3) Encoded values -> natural labels
+    for val, label in VALUE_LABELS.items():
+        text = re.sub(rf"\b{re.escape(val)}\b", label, text, flags=re.IGNORECASE)
+
+    # 4) Hide schema/SQL jargon
+    schema_terms = [
+        "schema", "table", "column", "sql", "join",
+        "primary key", "foreign key", "view", "constraint"
+    ]
+    for term in schema_terms:
+        text = re.sub(rf"\b{re.escape(term)}\b", "data", text, flags=re.IGNORECASE)
+
+    # 5) Strip markdown fences
+    return text.replace("```", "").strip()
+
+
+# === DB_SCHEMA_DOC v1.4 ===
+DB_SCHEMA_DOC = """
+### Global Rules & Conversions ###
+- **General Rule:** Provide summaries and insights only. Do NOT return raw data, full tables, or row-level dumps. If asked for a dump, refuse and suggest an aggregated view instead.
+- **Unit Conversion:** To compare data between tables, use:
+  - 1 TJ = 277.778 MWh
+  - The `tech_quantity` and `trade` tables store quantities in **thousand MWh**; multiply by 1000 for MWh.
+- **Data Granularity:** All tables with a `date` column contain **monthly** data (first day of month).
+- **Timeframe:** Data generally spans from 2015 to present.
+
+---
+### Table: public.dates ###
+Central reference for all monthly records.
+**Columns:**
+- `date`: Month (YYYY-MM-DD, first day).
+
+---
+### Table: public.energy_balance_long ###
+Energy consumption by sector and source (GEOSTAT).
+**Columns:**
+- `year`: Calendar year.
+- `sector`: Consuming sector (Industry, Transport, Other use).
+- `energy_source`: Energy type (Coal, Oil products, Natural Gas, Hydro, Wind, Solar, Biofuel & Waste, Electricity, Heat, Total).
+- `volume_tj`: Consumption in **TJ**.
+
+---
+### Table: public.entities ###
+Power sector entities.
+**Columns:**
+- `entity`: Raw name.
+- `entity_normalized`: Standardized identifier **(use for joins/analysis)**.
+- `type`: Entity type (HPP, TPP, Solar, Wind).
+- `ownership`: Owner.
+- `source`: Local vs import-dependent.
+
+---
+### Table: public.monthly_cpi ###
+CPI (2015=100).
+**Columns:**
+- `date`: Month.
+- `cpi_type`: CPI category (e.g., overall CPI, electricity_gas_and_other_fuels).
+- `cpi`: Value.
+**Note:** Large drop in electricity_gas_and_other_fuels CPI in Dec 2020–Feb 2021 due to subsidies.
+
+---
+### Table: public.price ###
+Monthly electricity prices.
+**Columns:**
+- `date`: Month.
+- `p_dereg_gel`: Deregulated price (GEL/MWh).
+- `p_bal_gel`: **Balancing price** (GEL/MWh).
+- `p_gcap_gel`: Guaranteed capacity fee (GEL/MWh).
+- `xrate`: GEL/USD.
+- `p_dereg_usd`, `p_bal_usd`, `p_gcap_usd`: USD equivalents.
+
+---
+### Table: public.tariff_gen ###
+GNERC-regulated tariffs.
+**Columns:**
+- `date`: Month.
+- `entity`: Plant (join with entities.entity).
+- `tariff_gel`: Tariff (GEL/MWh).
+- `tariff_usd`: Tariff (USD/MWh).
+**Rules:**
+- Missing **thermal** tariff ⇒ no generation that month.
+- Missing **hydro** tariff starting a month ⇒ deregulated onward.
+
+---
+### Table: public.tech_quantity ###
+Generation, demand, trade/transit aggregates.
+**Columns:**
+- `date`: Month.
+- `type_tech`: Category (`hydro`, `thermal`, `wind`, `import`, `export`, `losses`, `abkhazeti`, `transit`).
+- `quantity_tech`: **Thousand MWh**.
+**Key Synonyms for `type_tech`:**
+- "hydro generation", "HPP" → `hydro`
+- "thermal generation", "TPP" → `thermal`
+- "wind generation", "wind power plant", "wind turbine" → `wind`
+- "imports" → `import`
+- "exports" → `export`
+- "losses" → `losses`
+- "Abkhazeti consumption" → `abkhazeti`
+- "transit" → `transit` (spiked in 2022–2023 alongside Turkey gas prices)
+
+---
+### Table: public.trade ###
+Electricity trade outcomes by **entity** and **segment**.
+**Columns:**
+- `date`: Month.
+- `entity`: Plant (join with entities.entity).
+- `segment`: Market segment (`balancing`, `bilateral`, `exchange`, `thermal_ppa`, `renewable_ppa`).
+- `quantity`: **Thousand MWh**.
+**Key Synonyms for `segment`:**
+- "balancing electricity", "balancing market" → `balancing`
+- "bilateral contracts", "direct contracts" → `bilateral`
+- "thermal PPA", "conventional PPA" → `thermal_ppa`
+- "renewable PPA", "RES PPA", "green PPA" → `renewable_ppa`
+**Analytical Rules:**
+- **Renewable PPA share in balancing** (monthly):
+  - numerator: sum `quantity` where `segment = 'renewable_ppa'`
+  - denominator: sum `quantity` where `segment = 'balancing'`
+  - share = numerator / denominator
+- **PPA participation**: (`thermal_ppa + renewable_ppa`) vs total balancing volume.
+**Notes:**
+- Bilateral and exchange can be summed in some reports.
+- PPAs must sell to ESCO during mandatory periods.
+- We do not have separation of trade on exchange and with bilateral contract. THere are two segments: balacing electricity (so called balancing makret) and Bilateral & Exchange in total.
+- The exchange was launched in july 2024.
+
+---
+### Cross-Table Analytical Logic ###
+- **Price ↔ Trade**: Join on `date`. Compare `p_bal_gel` vs PPA shares in balancing.
+- **Price ↔ Tech Quantity**: Join on `date`. Supply/demand vs price dynamics.
+- **Price ↔ Monthly CPI**: Join on `date`. Price vs inflation categories.
+- **Price ↔ Energy Balance**: Aggregate price monthly to annual, compare to use.
+- **Trade ↔ Tech Quantity**: Join on `date`. Traded vs generated/exported.
+- **Trade ↔ Tariff Gen**: Join on `date` & `entity`. Tariff signals vs participation.
+- **Trade ↔ Entities**: Join on `entity`. Enrich trade with entity metadata.
+- **Trade ↔ Energy Balance**: Aggregate trade (annual) vs sector demand.
+- **Tech Quantity ↔ Energy Balance**: Annual totals vs sectoral consumption.
+- **Tech Quantity ↔ Monthly CPI**: Join on `date`. Demand/supply vs CPI.
+- **Tariff Gen ↔ Entities**: Join on `entity` for metadata.
+- **Tariff Gen ↔ Price**: Join on `date`. Regulated vs market indicators.
+- **Tariff Gen ↔ Tech Quantity**: Join on `date` & `entity`. Tariffs vs output.
+
 """
 
-STRICT_SQL_PROMPT = """
-You are an SQL generator. 
-Your ONLY job is to return a valid SQL query. 
-Do not explain, do not narrate, do not wrap in markdown. 
-If you cannot answer, return `SELECT 1;`.
-"""
-
-ANALYST_PROMPT = """
-You are an expert energy market analyst. Your task is to write a clear, concise narrative based *only* 
-on the structured data provided to you.
-
-### MANDATORY RULES ###
-1.  **NEVER GUESS.** Use ONLY the numbers and facts provided in the "Computed Stats" section.
-2.  **NEVER REVEAL INTERNALS.** Do not mention the database, SQL, or technical jargon.
-3.  **ALWAYS BE AN ANALYST.** Your response must be a narrative including trends, peaks, lows, 
-    seasonality, and forecasts (if available).
-4.  **CONCLUDE SUCCINCTLY.** End with a single, short "Key Insight" line.
-"""
-
-# --- Pydantic Models ---
-class Question(BaseModel):
-    query: str = Field(..., max_length=2000)
-    @validator("query")
-    def validate_query(cls, v):
-        if not v.strip():
-            raise ValueError("Query cannot be empty")
-        return v.strip()
-
-class APIResponse(BaseModel):
-    answer: str
-    execution_time: Optional[float] = None
-
-# --- Helpers ---
-def clean_and_validate_sql(sql: str) -> str:
-    if not sql:
-        raise ValueError("Generated SQL query is empty.")
-    cleaned_sql = re.sub(r"```(?:sql)?\s*|\s*```", "", sql, flags=re.IGNORECASE)
-    cleaned_sql = re.sub(r"--.*?$", "", cleaned_sql, flags=re.MULTILINE)
-    cleaned_sql = re.sub(r"\bLIMIT\s+\d+\b", "", cleaned_sql, flags=re.IGNORECASE)
-    cleaned_sql = cleaned_sql.strip().removesuffix(";")
-    if not cleaned_sql.strip().upper().startswith("SELECT"):
-        raise ValueError("Only SELECT statements are allowed.")
-    return cleaned_sql
-
-def extract_sql_from_steps(steps: List[Any]) -> Optional[str]:
-    sql_query = None
-    for step in steps:
-        action = step[0] if isinstance(step, tuple) else step
-        if isinstance(action, AgentAction):
-            if action.tool in ["sql_db_query", "sql_db_query_checker"]:
-                tool_input = action.tool_input
-                if isinstance(tool_input, dict) and 'query' in tool_input:
-                    sql_query = tool_input['query']
-                elif isinstance(tool_input, str):
-                    sql_query = tool_input
-    return sql_query
-
-def convert_decimal_to_float(obj):
-    if isinstance(obj, Decimal): return float(obj)
-    if isinstance(obj, list): return [convert_decimal_to_float(x) for x in obj]
-    if isinstance(obj, tuple): return tuple(convert_decimal_to_float(x) for x in obj)
-    if isinstance(obj, dict): return {k: convert_decimal_to_float(v) for k, v in obj.items()}
-    return obj
-
-def coerce_dataframe(rows: List[tuple], columns: List[str]) -> pd.DataFrame:
-    if not rows: return pd.DataFrame()
-    df = pd.DataFrame(rows, columns=columns)
-    for col in df.columns:
-        if df[col].dtype == 'object':
-            df[col] = df[col].apply(convert_decimal_to_float)
-    return df
-
-# --- Forecasting Helpers ---
-def _ensure_monthly_index(df: pd.DataFrame, date_col: str, value_col: str) -> pd.DataFrame:
-    df = df.copy()
-    df[date_col] = pd.to_datetime(df[date_col])
-    df = df.set_index(date_col).asfreq("MS")
-    df[value_col] = df[value_col].interpolate(method="linear")
-    return df.reset_index()
-
-def forecast_linear_ols(df: pd.DataFrame, date_col: str, value_col: str, target_date: datetime) -> Optional[Dict]:
-    try:
-        df = _ensure_monthly_index(df, date_col, value_col)
-        df["t"] = (df[date_col] - df[date_col].min()) / np.timedelta64(1, "M")
-        X = sm.add_constant(df["t"])
-        y = df[value_col]
-
-        try:
-            stl = STL(y, period=12, robust=True)
-            res = stl.fit()
-            y = res.trend
-        except Exception as e:
-            logger.warning(f"STL decomposition failed, falling back to raw OLS: {e}")
-
-        model = sm.OLS(y, X).fit()
-        future_t = (pd.to_datetime(target_date) - df[date_col].min()) / np.timedelta64(1, "M")
-        X_future = sm.add_constant(pd.DataFrame({"t": [future_t]}))
-        pred = model.get_prediction(X_future)
-        pred_summary = pred.summary_frame(alpha=0.10)  # 90% CI
-
-        return {
-            "target_month": target_date.strftime("%Y-%m"),
-            "point": float(pred_summary["mean"].iloc[0]),
-            "90% CI": [float(pred_summary["mean_ci_lower"].iloc[0]), float(pred_summary["mean_ci_upper"].iloc[0])],
-            "slope_per_month": float(model.params["t"]) if "t" in model.params else None,
-            "R²": float(model.rsquared),
-            "n_obs": int(model.nobs),
-        }
-    except Exception as e:
-        logger.error(f"Forecast failed: {e}", exc_info=True)
-        return None
-
-def detect_forecast_intent(query: str) -> (bool, Optional[datetime]):
-    q = query.lower()
-    if "forecast" in q or "predict" in q or "estimate" in q:
-        for yr in range(2025, 2040):
-            if str(yr) in q:
-                try:
-                    return True, datetime(yr, 12, 1)
-                except:
-                    pass
-        return True, datetime(2030, 12, 1)
-    return False, None
-
-# --- Preload LLMs & Agents at Startup ---
-llm_sql = ChatOpenAI(model="gpt-4o-mini", temperature=0, openai_api_key=OPENAI_API_KEY)
-llm_analyst = ChatOpenAI(model="gpt-4o", temperature=0, openai_api_key=OPENAI_API_KEY)
-
-toolkit = SQLDatabaseToolkit(db=db, llm=llm_sql)
-
-preloaded_agent = create_sql_agent(
-    llm=llm_sql,
-    toolkit=toolkit,
-    verbose=True,
-    agent_type="openai-tools",
-    system_message=SQL_GENERATOR_PROMPT,
-    top_k=1000
-)
-
-strict_agent = create_sql_agent(
-    llm=llm_sql,
-    toolkit=toolkit,
-    verbose=True,
-    agent_type="openai-tools",
-    system_message=STRICT_SQL_PROMPT,
-    top_k=1000
-)
-
-# --- API Endpoint ---
-@app.get("/healthz")
-def health():
-    return {"status": "ok"}
-
-@app.post("/ask", response_model=APIResponse)
-def ask(q: Question, x_app_key: str = Header(...)):
-    start_time = time.time()
-    if x_app_key != APP_SECRET_KEY:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    try:
-        logger.info("Step 1: Invoking preloaded agent to generate SQL.")
-        result = preloaded_agent.invoke({"input": q.query}, return_intermediate_steps=True)
-        sql_query = extract_sql_from_steps(result.get("intermediate_steps", []))
-
-        if not sql_query and "output" in result and "SELECT" in str(result["output"]).upper():
-            sql_query = result["output"]
-
-        if not sql_query:
-            logger.warning("Agent failed to generate SQL. Retrying with strict agent...")
-            result_retry = strict_agent.invoke({"input": q.query}, return_intermediate_steps=True)
-            sql_query = extract_sql_from_steps(result_retry.get("intermediate_steps", []))
-
-        if not sql_query:
-            logger.error("Both attempts failed to generate SQL. Falling back to text output.")
-            final_answer = result.get("output", "I was unable to formulate a query to answer the question.")
-        else:
-            safe_sql = clean_and_validate_sql(sql_query)
-            logger.info(f"Step 2: Executing SQL: {safe_sql}")
-
-            with engine.connect() as conn:
-                cursor_result = conn.execute(text(safe_sql))
-                rows = cursor_result.fetchall()
-                columns = list(cursor_result.keys())
-
-            if not rows:
-                final_answer = result.get("output", "The query executed successfully but returned no data.")
-            else:
-                df = coerce_dataframe(rows, columns)
-                computed = {}
-
-                do_forecast, target_dt = detect_forecast_intent(q.query)
-                if do_forecast:
-                    candidate_cols = [c for c in df.columns if "price" in c.lower() or "p_bal" in c.lower()]
-                    value_col = candidate_cols[0] if candidate_cols else None
-                    if "date" in df.columns and value_col:
-                        fc = forecast_linear_ols(df, date_col="date", value_col=value_col, target_date=target_dt)
-                        if fc:
-                            computed[f"Balancing Price Forecast ({fc['target_month']})"] = fc
-
-                narrative = llm_analyst.invoke([
-                    {"role": "system", "content": ANALYST_PROMPT},
-                    {"role": "user", "content": f"Question: {q.query}\n\nComputed Stats: {computed}"}
-                ])
-                final_answer = narrative.content if hasattr(narrative, "content") else str(narrative)
-
-        final_answer = scrub_schema_mentions(final_answer)
-        if "forecast" in q.query.lower() or "predict" in q.query.lower() or "estimate" in q.query.lower():
-            final_answer += "\n\nDisclaimer: This is a rough estimate based on a limited number of variables and current trends. It does not account for structural or policy changes that may affect future prices."
-
-        return APIResponse(answer=final_answer, execution_time=round(time.time() - start_time, 2))
-    except Exception as e:
-        logger.error(f"FATAL error in /ask endpoint: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="An internal processing error occurred.")
+# === DB_JOINS v1.4 ===
+DB_JOINS = {
+    "dates": {"join_on": "date", "related_to": ["price", "monthly_cpi", "tech_quantity", "trade", "tariff_gen"]},
+    "energy_balance_long": {"join_on": "year", "related_to": ["tech_quantity", "price", "monthly_cpi", "trade"]},
+    "price": {"join_on": "date", "related_to": ["trade", "tech_quantity", "monthly_cpi", "energy_balance_long"]},
+    "trade": {"join_on": ["date", "entity"], "related_to": ["price", "entities", "tariff_gen", "tech_quantity", "energy_balance_long"]},
+    "tech_quantity": {"join_on": "date", "related_to": ["price", "energy_balance_long", "trade", "monthly_cpi"]},
+    "tariff_gen": {"join_on": ["date", "entity"], "related_to": ["entities", "trade", "price", "tech_quantity"]},
+    "entities": {"join_on": "entity", "related_to": ["tariff_gen", "trade"]},
+    "monthly_cpi": {"join_on": "date", "related_to": ["price", "tech_quantity", "energy_balance_long"]},
+}
