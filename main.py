@@ -23,6 +23,7 @@ from decimal import Decimal
 import numpy as np
 import pandas as pd
 import statsmodels.api as sm
+from statsmodels.tsa.seasonal import STL
 
 # --- Configuration & Setup ---
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
@@ -60,7 +61,7 @@ class SQLCaptureHandler(BaseCallbackHandler):
                 self.sql_query = action.tool_input
 
 # --- FastAPI Application ---
-app = FastAPI(title="EnerBot Backend", version="16.12-predict-now")
+app = FastAPI(title="EnerBot Backend", version="16.13-seasonal-90ci")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 # --- System Prompts ---
@@ -144,22 +145,49 @@ def coerce_dataframe(rows: List[tuple], columns: List[str]) -> pd.DataFrame:
             df[col] = df[col].apply(convert_decimal_to_float)
     return df
 
-# --- Forecasting ---
-def forecast_linear_ols(df: pd.DataFrame, date_col: str, value_col: str, target_date: datetime) -> Optional[Dict[str, Any]]:
+# --- Seasonality & Forecasting ---
+def _ensure_monthly_index(dfa: pd.DataFrame, date_col: str, value_col: str) -> pd.Series:
+    s = dfa[[date_col, value_col]].dropna().copy()
+    s[date_col] = pd.to_datetime(s[date_col])
+    s = s.sort_values(date_col)
+    ser = s.set_index(date_col)[value_col].asfreq("MS")
+    ser = ser.interpolate(limit_direction="both")  # mild fill to avoid STL failure
+    return ser
+
+def detect_seasonality_strength(dfa: pd.DataFrame, date_col: str, value_col: str) -> float:
+    """
+    Hyndman-style seasonality strength using STL:
+    strength = max(0, 1 - var(remainder) / var(seasonal + remainder))
+    Returns 0..1 (higher → stronger seasonality). Falls back to 0 if too short.
+    """
+    try:
+        ser = _ensure_monthly_index(dfa, date_col, value_col)
+        if len(ser) < 36:  # need enough cycles
+            return 0.0
+        stl = STL(ser, period=12, robust=True).fit()
+        resid = stl.resid
+        seas = stl.seasonal
+        strength = max(0.0, 1.0 - (np.var(resid) / np.var(seas + resid)))
+        return float(strength)
+    except Exception as e:
+        logger.warning(f"Seasonality detection failed: {e}")
+        return 0.0
+
+def forecast_linear_ols_90(df: pd.DataFrame, date_col: str, value_col: str, target_date: datetime) -> Optional[Dict[str, Any]]:
+    """Simple trend-only OLS with 90% CI."""
     try:
         dfa = df[[date_col, value_col]].dropna().copy()
         if dfa.empty:
             return None
         dfa[date_col] = pd.to_datetime(dfa[date_col])
         dfa = dfa.sort_values(date_col)
-        # numeric time index in months since start
         dfa["t"] = (dfa[date_col] - dfa[date_col].min()) / np.timedelta64(1, "M")
         X = sm.add_constant(dfa["t"].values)
         y = dfa[value_col].astype(float).values
         model = sm.OLS(y, X).fit()
         t_future = (pd.to_datetime(target_date) - dfa[date_col].min()) / np.timedelta64(1, "M")
         X_future = sm.add_constant([t_future])
-        pred = model.get_prediction(X_future).summary_frame(alpha=0.05)
+        pred = model.get_prediction(X_future).summary_frame(alpha=0.10)  # 90% CI
         return {
             "target_month": target_date.strftime("%Y-%m"),
             "point": float(pred["mean"].iloc[0]),
@@ -168,9 +196,70 @@ def forecast_linear_ols(df: pd.DataFrame, date_col: str, value_col: str, target_
             "slope_per_month": float(model.params[1]),
             "r2": float(model.rsquared),
             "n_obs": int(len(dfa)),
+            "seasonal": False
         }
     except Exception as e:
-        logger.warning(f"Forecast failed: {e}")
+        logger.warning(f"Trend OLS forecast failed: {e}")
+        return None
+
+def forecast_seasonal_ols_90(df: pd.DataFrame, date_col: str, value_col: str, target_date: datetime) -> Optional[Dict[str, Any]]:
+    """
+    Seasonal OLS: y = const + beta*t + sum(gamma_m * month_dummies) + e
+    90% CI via statsmodels get_prediction.
+    Also returns aggregated Summer (Jun–Aug) and Winter (Dec–Feb) 2030 forecasts.
+    """
+    try:
+        dfa = df[[date_col, value_col]].dropna().copy()
+        if dfa.empty:
+            return None
+        dfa[date_col] = pd.to_datetime(dfa[date_col])
+        dfa = dfa.sort_values(date_col)
+        dfa["t"] = (dfa[date_col] - dfa[date_col].min()) / np.timedelta64(1, "M")
+        dfa["month"] = dfa[date_col].dt.month.astype(int)
+        # Month dummies (1..12), drop one to avoid multicollinearity
+        month_dummies = pd.get_dummies(dfa["month"], prefix="m", drop_first=True)
+        X = pd.concat([pd.Series(1.0, index=dfa.index, name="const"), dfa["t"], month_dummies], axis=1)
+        y = dfa[value_col].astype(float).values
+        model = sm.OLS(y, X.values).fit()
+
+        # Helper to predict any (year, month)
+        def _predict_y(year: int, month: int):
+            t_val = ((pd.Timestamp(year=year, month=month, day=1) - dfa[date_col].min()) / np.timedelta64(1, "M"))
+            row = {"const": 1.0, "t": float(t_val)}
+            for m in range(2, 13):  # dummies m_2 ... m_12 (m_1 is baseline)
+                row[f"m_{m}"] = 1.0 if month == m else 0.0
+            x_vec = np.array([row.get(col, 0.0) for col in ["const", "t"] + [f"m_{m}" for m in range(2, 13)]])
+            pred = model.get_prediction(x_vec.reshape(1, -1)).summary_frame(alpha=0.10)  # 90% CI
+            return float(pred["mean"].iloc[0]), float(pred["mean_ci_lower"].iloc[0]), float(pred["mean_ci_upper"].iloc[0])
+
+        # Point month forecast:
+        tm = target_date.month
+        point, lo, hi = _predict_y(target_date.year, tm)
+
+        # Seasonal bands for 2030:
+        summer_months = [6, 7, 8]
+        winter_months = [12, 1, 2]
+        summer_preds = [_predict_y(2030, m) for m in summer_months]
+        winter_preds = [_predict_y(2030, m) for m in winter_months]
+        # Average the means and CIs (approximation)
+        summer_point = float(np.mean([p[0] for p in summer_preds]))
+        summer_lo = float(np.mean([p[1] for p in summer_preds]))
+        summer_hi = float(np.mean([p[2] for p in summer_preds]))
+        winter_point = float(np.mean([p[0] for p in winter_preds]))
+        winter_lo = float(np.mean([p[1] for p in winter_preds]))
+        winter_hi = float(np.mean([p[2] for p in winter_preds]))
+
+        return {
+            "target_month": target_date.strftime("%Y-%m"),
+            "point": point, "ci_lower": lo, "ci_upper": hi,
+            "summer": {"point": summer_point, "ci_lower": summer_lo, "ci_upper": summer_hi},
+            "winter": {"point": winter_point, "ci_lower": winter_lo, "ci_upper": winter_hi},
+            "r2": float(model.rsquared),
+            "n_obs": int(len(dfa)),
+            "seasonal": True
+        }
+    except Exception as e:
+        logger.warning(f"Seasonal OLS forecast failed: {e}")
         return None
 
 def generate_narrative(llm: ChatOpenAI, user_query: str, computed: Dict) -> str:
@@ -234,7 +323,10 @@ def ask(q: Question, x_app_key: str = Header(...)):
         if not sql_query:
             logger.error("Both attempts failed to generate SQL. Falling back to text output.")
             final_answer = result.get("output", "I was unable to formulate a query to answer the question.")
-            return APIResponse(answer=scrub_schema_mentions(final_answer), execution_time=round(time.time() - start_time, 2))
+            final_answer = scrub_schema_mentions(final_answer)
+            # Always append disclaimer
+            final_answer = (final_answer + "\n\nDisclaimer: This is a rough estimate based on a limited set of variables and current trends; it does not account for future structural or policy changes.").strip()
+            return APIResponse(answer=final_answer, execution_time=round(time.time() - start_time, 2))
 
         safe_sql = clean_and_validate_sql(sql_query)
         logger.info(f"Step 2: Executing SQL: {safe_sql}")
@@ -246,37 +338,65 @@ def ask(q: Question, x_app_key: str = Header(...)):
 
         if not rows:
             final_answer = result.get("output", "The query executed successfully but returned no data.")
-            return APIResponse(answer=scrub_schema_mentions(final_answer), execution_time=round(time.time() - start_time, 2))
+            final_answer = scrub_schema_mentions(final_answer)
+            final_answer = (final_answer + "\n\nDisclaimer: This is a rough estimate based on a limited set of variables and current trends; it does not account for future structural or policy changes.").strip()
+            return APIResponse(answer=final_answer, execution_time=round(time.time() - start_time, 2))
 
-        # --- Analysis & Forecast (deterministic) ---
+        # --- Analysis & Seasonal Forecast (deterministic) ---
         df = coerce_dataframe(rows, columns)
 
         forecast_line = ""
+        computed: Dict[str, Any] = {}
+
         try:
-            # If we have balancing price, ALWAYS compute a Dec-2030 forecast
+            # Identify balancing price column; proceed if present with date
             if "date" in df.columns:
                 df["date"] = pd.to_datetime(df["date"], errors="coerce")
             value_col = next((c for c in df.columns if c.lower() in ("p_bal_gel", "p_bal", "balancing_price", "price")), None)
+
             if value_col and "date" in df.columns:
-                fc = forecast_linear_ols(df, date_col="date", value_col=value_col, target_date=datetime(2030, 12, 1))
-                if fc:
-                    forecast_line = (
-                        f"Forecast for {fc['target_month']}: {fc['point']:.2f} GEL/MWh "
-                        f"(95% CI: {fc['ci_lower']:.2f}–{fc['ci_upper']:.2f}); "
-                        f"slope {fc['slope_per_month']:.4f}/month, R²={fc['r2']:.3f}, n={fc['n_obs']}."
-                    )
+                # Detect seasonality strength
+                strength = detect_seasonality_strength(df, "date", value_col)
+                is_seasonal = strength >= 0.20  # threshold
+
+                target_dt = datetime(2030, 12, 1)
+
+                if is_seasonal:
+                    fc = forecast_seasonal_ols_90(df, date_col="date", value_col=value_col, target_date=target_dt)
+                    if fc:
+                        forecast_line = (
+                            f"December 2030 forecast: {fc['point']:.2f} GEL/MWh "
+                            f"(90% CI: {fc['ci_lower']:.2f}–{fc['ci_upper']:.2f}); "
+                            f"Seasonality detected (strength≈{strength:.2f}), R²={fc['r2']:.3f}, n={fc['n_obs']}.\n"
+                            f"Seasonal band (2030) — Summer(Jun–Aug): {fc['summer']['point']:.2f} "
+                            f"(90% CI: {fc['summer']['ci_lower']:.2f}–{fc['summer']['ci_upper']:.2f}); "
+                            f"Winter(Dec–Feb): {fc['winter']['point']:.2f} "
+                            f"(90% CI: {fc['winter']['ci_lower']:.2f}–{fc['winter']['ci_upper']:.2f})."
+                        )
+                        computed["Seasonality Strength (0-1)"] = round(strength, 2)
+                else:
+                    fc = forecast_linear_ols_90(df, date_col="date", value_col=value_col, target_date=target_dt)
+                    if fc:
+                        forecast_line = (
+                            f"December 2030 forecast: {fc['point']:.2f} GEL/MWh "
+                            f"(90% CI: {fc['ci_lower']:.2f}–{fc['ci_upper']:.2f}); "
+                            f"Trend-only (no strong seasonality), slope {fc['slope_per_month']:.4f}/month, "
+                            f"R²={fc['r2']:.3f}, n={fc['n_obs']}."
+                        )
+                        computed["Seasonality Strength (0-1)"] = round(strength, 2)
         except Exception as e:
             logger.warning(f"Forecast block failed: {e}")
 
-        # Minimal computed stats (optional)
-        computed = {}
         if forecast_line:
-            computed["Balancing Price Forecast (2030-12)"] = forecast_line
+            computed["Forecast (Dec-2030)"] = forecast_line
 
         narrative = generate_narrative(llm, q.query, computed)
-        final_answer = (forecast_line + ("\n" if forecast_line else "") + narrative).strip()
+        final_answer = (forecast_line + ("\n\n" if forecast_line else "") + narrative).strip()
+        final_answer = scrub_schema_mentions(final_answer)
+        # Always append disclaimer
+        final_answer = (final_answer + "\n\nDisclaimer: This is a rough estimate based on a limited set of variables and current trends; it does not account for future structural or policy changes.").strip()
 
-        return APIResponse(answer=scrub_schema_mentions(final_answer), execution_time=round(time.time() - start_time, 2))
+        return APIResponse(answer=final_answer, execution_time=round(time.time() - start_time, 2))
 
     except Exception as e:
         logger.error(f"FATAL error in /ask endpoint: {e}", exc_info=True)
