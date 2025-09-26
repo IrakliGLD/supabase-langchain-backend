@@ -1,4 +1,4 @@
-# === context.py v1.4 ===
+# === context.py v1.5 ===
 # Unified schema doc + joins + human-friendly labels + scrubber
 
 import re
@@ -138,7 +138,7 @@ def scrub_schema_mentions(text: str) -> str:
     return text.replace("```", "").strip()
 
 
-# === DB_SCHEMA_DOC v1.4 ===
+# === DB_SCHEMA_DOC v1.5 ===
 DB_SCHEMA_DOC = """
 ### Global Rules & Conversions ###
 - **General Rule:** Provide summaries and insights only. Do NOT return raw data, full tables, or row-level dumps. If asked for a dump, refuse and suggest an aggregated view instead.
@@ -147,122 +147,13 @@ DB_SCHEMA_DOC = """
   - The `tech_quantity` and `trade` tables store quantities in **thousand MWh**; multiply by 1000 for MWh.
 - **Data Granularity:** All tables with a `date` column contain **monthly** data (first day of month).
 - **Timeframe:** Data generally spans from 2015 to present.
+- **Forecasting Restriction:** Forecasts can be made for prices, CPI, and demand. 
+  For generation (hydro, thermal, wind, solar) and imports/exports: 
+  only historical trends can be shown. Future projections depend on new capacity/projects not available in this data.
 
 ---
 ### Table: public.dates ###
-Central reference for all monthly records.
-**Columns:**
-- `date`: Month (YYYY-MM-DD, first day).
-
----
-### Table: public.energy_balance_long ###
-Energy consumption by sector and source (GEOSTAT).
-**Columns:**
-- `year`: Calendar year.
-- `sector`: Consuming sector (Industry, Transport, Other use).
-- `energy_source`: Energy type (Coal, Oil products, Natural Gas, Hydro, Wind, Solar, Biofuel & Waste, Electricity, Heat, Total).
-- `volume_tj`: Consumption in **TJ**.
-
----
-### Table: public.entities ###
-Power sector entities.
-**Columns:**
-- `entity`: Raw name.
-- `entity_normalized`: Standardized identifier **(use for joins/analysis)**.
-- `type`: Entity type (HPP, TPP, Solar, Wind).
-- `ownership`: Owner.
-- `source`: Local vs import-dependent.
-
----
-### Table: public.monthly_cpi ###
-CPI (2015=100).
-**Columns:**
-- `date`: Month.
-- `cpi_type`: CPI category (e.g., overall CPI, electricity_gas_and_other_fuels).
-- `cpi`: Value.
-**Note:** Large drop in electricity_gas_and_other_fuels CPI in Dec 2020–Feb 2021 due to subsidies.
-
----
-### Table: public.price ###
-Monthly electricity prices.
-**Columns:**
-- `date`: Month.
-- `p_dereg_gel`: Deregulated price (GEL/MWh).
-- `p_bal_gel`: **Balancing price** (GEL/MWh).
-- `p_gcap_gel`: Guaranteed capacity fee (GEL/MWh).
-- `xrate`: GEL/USD.
-- `p_dereg_usd`, `p_bal_usd`, `p_gcap_usd`: USD equivalents.
-
----
-### Table: public.tariff_gen ###
-GNERC-regulated tariffs.
-**Columns:**
-- `date`: Month.
-- `entity`: Plant (join with entities.entity).
-- `tariff_gel`: Tariff (GEL/MWh).
-- `tariff_usd`: Tariff (USD/MWh).
-**Rules:**
-- Missing **thermal** tariff ⇒ no generation that month.
-- Missing **hydro** tariff starting a month ⇒ deregulated onward.
-
----
-### Table: public.tech_quantity ###
-Generation, demand, trade/transit aggregates.
-**Columns:**
-- `date`: Month.
-- `type_tech`: Category (`hydro`, `thermal`, `wind`, `import`, `export`, `losses`, `abkhazeti`, `transit`).
-- `quantity_tech`: **Thousand MWh**.
-**Key Synonyms for `type_tech`:**
-- "hydro generation", "HPP" → `hydro`
-- "thermal generation", "TPP" → `thermal`
-- "wind generation", "wind power plant", "wind turbine" → `wind`
-- "imports" → `import`
-- "exports" → `export`
-- "losses" → `losses`
-- "Abkhazeti consumption" → `abkhazeti`
-- "transit" → `transit` (spiked in 2022–2023 alongside Turkey gas prices)
-
----
-### Table: public.trade ###
-Electricity trade outcomes by **entity** and **segment**.
-**Columns:**
-- `date`: Month.
-- `entity`: Plant (join with entities.entity).
-- `segment`: Market segment (`balancing`, `bilateral`, `exchange`, `thermal_ppa`, `renewable_ppa`).
-- `quantity`: **Thousand MWh**.
-**Key Synonyms for `segment`:**
-- "balancing electricity", "balancing market" → `balancing`
-- "bilateral contracts", "direct contracts" → `bilateral`
-- "thermal PPA", "conventional PPA" → `thermal_ppa`
-- "renewable PPA", "RES PPA", "green PPA" → `renewable_ppa`
-**Analytical Rules:**
-- **Renewable PPA share in balancing** (monthly):
-  - numerator: sum `quantity` where `segment = 'renewable_ppa'`
-  - denominator: sum `quantity` where `segment = 'balancing'`
-  - share = numerator / denominator
-- **PPA participation**: (`thermal_ppa + renewable_ppa`) vs total balancing volume.
-**Notes:**
-- Bilateral and exchange can be summed in some reports.
-- PPAs must sell to ESCO during mandatory periods.
-- We do not have separation of trade on exchange and with bilateral contract. THere are two segments: balacing electricity (so called balancing makret) and Bilateral & Exchange in total.
-- The exchange was launched in july 2024.
-
----
-### Cross-Table Analytical Logic ###
-- **Price ↔ Trade**: Join on `date`. Compare `p_bal_gel` vs PPA shares in balancing.
-- **Price ↔ Tech Quantity**: Join on `date`. Supply/demand vs price dynamics.
-- **Price ↔ Monthly CPI**: Join on `date`. Price vs inflation categories.
-- **Price ↔ Energy Balance**: Aggregate price monthly to annual, compare to use.
-- **Trade ↔ Tech Quantity**: Join on `date`. Traded vs generated/exported.
-- **Trade ↔ Tariff Gen**: Join on `date` & `entity`. Tariff signals vs participation.
-- **Trade ↔ Entities**: Join on `entity`. Enrich trade with entity metadata.
-- **Trade ↔ Energy Balance**: Aggregate trade (annual) vs sector demand.
-- **Tech Quantity ↔ Energy Balance**: Annual totals vs sectoral consumption.
-- **Tech Quantity ↔ Monthly CPI**: Join on `date`. Demand/supply vs CPI.
-- **Tariff Gen ↔ Entities**: Join on `entity` for metadata.
-- **Tariff Gen ↔ Price**: Join on `date`. Regulated vs market indicators.
-- **Tariff Gen ↔ Tech Quantity**: Join on `date` & `entity`. Tariffs vs output.
-
+...
 """
 
 # === DB_JOINS v1.4 ===
