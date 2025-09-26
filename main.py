@@ -49,7 +49,7 @@ engine = create_engine(SUPABASE_DB_URL, poolclass=QueuePool, pool_size=10, pool_
 db = SQLDatabase(engine, include_tables=ALLOWED_TABLES)
 
 # --- FastAPI Application ---
-app = FastAPI(title="EnerBot Backend", version="17.0-forecast-ci90")
+app = FastAPI(title="EnerBot Backend", version="17.1-fast-sql")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 # --- System Prompts ---
@@ -155,7 +155,6 @@ def forecast_linear_ols(df: pd.DataFrame, date_col: str, value_col: str, target_
         X = sm.add_constant(df["t"])
         y = df[value_col]
 
-        # Try seasonal STL first
         try:
             stl = STL(y, period=12, robust=True)
             res = stl.fit()
@@ -204,16 +203,18 @@ def ask(q: Question, x_app_key: str = Header(...)):
     if x_app_key != APP_SECRET_KEY:
         raise HTTPException(status_code=401, detail="Unauthorized")
     try:
-        llm = ChatOpenAI(model="gpt-4o", temperature=0, openai_api_key=OPENAI_API_KEY)
-        toolkit = SQLDatabaseToolkit(db=db, llm=llm)
+        # --- Two-model setup ---
+        sql_llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, openai_api_key=OPENAI_API_KEY)
+        analyst_llm = ChatOpenAI(model="gpt-4o", temperature=0, openai_api_key=OPENAI_API_KEY)
 
+        toolkit = SQLDatabaseToolkit(db=db, llm=sql_llm)
         agent = create_sql_agent(
-            llm=llm,
+            llm=sql_llm,
             toolkit=toolkit,
             verbose=True,
             agent_type="openai-tools",
             system_message=SQL_GENERATOR_PROMPT,
-            top_k=10000
+            top_k=50  # much lower since schema is preloaded
         )
 
         logger.info("Step 1: Invoking agent to generate SQL.")
@@ -226,12 +227,12 @@ def ask(q: Question, x_app_key: str = Header(...)):
         if not sql_query:
             logger.warning("Agent failed to generate SQL. Retrying with stricter prompt...")
             strict_agent = create_sql_agent(
-                llm=llm,
+                llm=sql_llm,
                 toolkit=toolkit,
                 verbose=True,
                 agent_type="openai-tools",
                 system_message=STRICT_SQL_PROMPT,
-                top_k=10000
+                top_k=50
             )
             result_retry = strict_agent.invoke({"input": q.query}, return_intermediate_steps=True)
             sql_query = extract_sql_from_steps(result_retry.get("intermediate_steps", []))
@@ -263,7 +264,7 @@ def ask(q: Question, x_app_key: str = Header(...)):
                         if fc:
                             computed[f"Balancing Price Forecast ({fc['target_month']})"] = fc
 
-                narrative = llm.invoke([
+                narrative = analyst_llm.invoke([
                     {"role": "system", "content": ANALYST_PROMPT},
                     {"role": "user", "content": f"Question: {q.query}\n\nComputed Stats: {computed}"}
                 ])
