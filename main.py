@@ -1,14 +1,15 @@
-import os 
+import os
 import re
 import logging
 import time
 from datetime import datetime
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional, Dict, Any, List
 
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, validator
 from sqlalchemy import create_engine, text
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.pool import QueuePool
 
 from langchain_openai import ChatOpenAI
@@ -16,7 +17,6 @@ from langchain_community.utilities import SQLDatabase
 from langchain.agents import create_sql_agent
 from langchain.agents.agent_toolkits import SQLDatabaseToolkit
 from langchain_core.agents import AgentAction
-from langchain.callbacks.base import BaseCallbackHandler
 
 from dotenv import load_dotenv
 from decimal import Decimal
@@ -37,7 +37,7 @@ APP_SECRET_KEY = os.getenv("APP_SECRET_KEY")
 if not all([OPENAI_API_KEY, SUPABASE_DB_URL, APP_SECRET_KEY]):
     raise RuntimeError("One or more essential environment variables are missing.")
 
-# --- Import DB Schema & Joins & scrubber from context.py ---
+# --- Import DB Schema & Joins ---
 from context import DB_SCHEMA_DOC, DB_JOINS, scrub_schema_mentions
 
 ALLOWED_TABLES = [
@@ -48,20 +48,8 @@ ALLOWED_TABLES = [
 engine = create_engine(SUPABASE_DB_URL, poolclass=QueuePool, pool_size=10, pool_pre_ping=True)
 db = SQLDatabase(engine, include_tables=ALLOWED_TABLES)
 
-# --- Callback Handler to Reliably Capture SQL the Agent Executes ---
-class SQLCaptureHandler(BaseCallbackHandler):
-    def __init__(self):
-        self.sql_query: Optional[str] = None
-
-    def on_agent_action(self, action: AgentAction, **kwargs: Any) -> None:
-        if action.tool == "sql_db_query":
-            if isinstance(action.tool_input, dict):
-                self.sql_query = action.tool_input.get("query")
-            elif isinstance(action.tool_input, str):
-                self.sql_query = action.tool_input
-
 # --- FastAPI Application ---
-app = FastAPI(title="EnerBot Backend", version="16.13-seasonal-90ci")
+app = FastAPI(title="EnerBot Backend", version="17.0-forecast-ci90")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 # --- System Prompts ---
@@ -124,11 +112,18 @@ def clean_and_validate_sql(sql: str) -> str:
         raise ValueError("Only SELECT statements are allowed.")
     return cleaned_sql
 
-def extract_sql_from_text_blob(blob: str) -> Optional[str]:
-    if not blob:
-        return None
-    m = re.search(r"SELECT\s+[\s\S]*?;", blob, flags=re.IGNORECASE)
-    return m.group(0) if m else None
+def extract_sql_from_steps(steps: List[Any]) -> Optional[str]:
+    sql_query = None
+    for step in steps:
+        action = step[0] if isinstance(step, tuple) else step
+        if isinstance(action, AgentAction):
+            if action.tool in ["sql_db_query", "sql_db_query_checker"]:
+                tool_input = action.tool_input
+                if isinstance(tool_input, dict) and 'query' in tool_input:
+                    sql_query = tool_input['query']
+                elif isinstance(tool_input, str):
+                    sql_query = tool_input
+    return sql_query
 
 def convert_decimal_to_float(obj):
     if isinstance(obj, Decimal): return float(obj)
@@ -145,128 +140,58 @@ def coerce_dataframe(rows: List[tuple], columns: List[str]) -> pd.DataFrame:
             df[col] = df[col].apply(convert_decimal_to_float)
     return df
 
-# --- Seasonality & Forecasting ---
-def _ensure_monthly_index(dfa: pd.DataFrame, date_col: str, value_col: str) -> pd.Series:
-    s = dfa[[date_col, value_col]].dropna().copy()
-    s[date_col] = pd.to_datetime(s[date_col])
-    s = s.sort_values(date_col)
-    ser = s.set_index(date_col)[value_col].asfreq("MS")
-    ser = ser.interpolate(limit_direction="both")  # mild fill to avoid STL failure
-    return ser
+# --- Forecasting Helpers ---
+def _ensure_monthly_index(df: pd.DataFrame, date_col: str, value_col: str) -> pd.DataFrame:
+    df = df.copy()
+    df[date_col] = pd.to_datetime(df[date_col])
+    df = df.set_index(date_col).asfreq("MS")
+    df[value_col] = df[value_col].interpolate(method="linear")
+    return df.reset_index()
 
-def detect_seasonality_strength(dfa: pd.DataFrame, date_col: str, value_col: str) -> float:
-    """
-    Hyndman-style seasonality strength using STL:
-    strength = max(0, 1 - var(remainder) / var(seasonal + remainder))
-    Returns 0..1 (higher → stronger seasonality). Falls back to 0 if too short.
-    """
+def forecast_linear_ols(df: pd.DataFrame, date_col: str, value_col: str, target_date: datetime) -> Optional[Dict]:
     try:
-        ser = _ensure_monthly_index(dfa, date_col, value_col)
-        if len(ser) < 36:  # need enough cycles
-            return 0.0
-        stl = STL(ser, period=12, robust=True).fit()
-        resid = stl.resid
-        seas = stl.seasonal
-        strength = max(0.0, 1.0 - (np.var(resid) / np.var(seas + resid)))
-        return float(strength)
-    except Exception as e:
-        logger.warning(f"Seasonality detection failed: {e}")
-        return 0.0
+        df = _ensure_monthly_index(df, date_col, value_col)
+        df["t"] = (df[date_col] - df[date_col].min()) / np.timedelta64(1, "M")
+        X = sm.add_constant(df["t"])
+        y = df[value_col]
 
-def forecast_linear_ols_90(df: pd.DataFrame, date_col: str, value_col: str, target_date: datetime) -> Optional[Dict[str, Any]]:
-    """Simple trend-only OLS with 90% CI."""
-    try:
-        dfa = df[[date_col, value_col]].dropna().copy()
-        if dfa.empty:
-            return None
-        dfa[date_col] = pd.to_datetime(dfa[date_col])
-        dfa = dfa.sort_values(date_col)
-        dfa["t"] = (dfa[date_col] - dfa[date_col].min()) / np.timedelta64(1, "M")
-        X = sm.add_constant(dfa["t"].values)
-        y = dfa[value_col].astype(float).values
+        # Try seasonal STL first
+        try:
+            stl = STL(y, period=12, robust=True)
+            res = stl.fit()
+            y = res.trend
+        except Exception as e:
+            logger.warning(f"STL decomposition failed, falling back to raw OLS: {e}")
+
         model = sm.OLS(y, X).fit()
-        t_future = (pd.to_datetime(target_date) - dfa[date_col].min()) / np.timedelta64(1, "M")
-        X_future = sm.add_constant([t_future])
-        pred = model.get_prediction(X_future).summary_frame(alpha=0.10)  # 90% CI
-        return {
-            "target_month": target_date.strftime("%Y-%m"),
-            "point": float(pred["mean"].iloc[0]),
-            "ci_lower": float(pred["mean_ci_lower"].iloc[0]),
-            "ci_upper": float(pred["mean_ci_upper"].iloc[0]),
-            "slope_per_month": float(model.params[1]),
-            "r2": float(model.rsquared),
-            "n_obs": int(len(dfa)),
-            "seasonal": False
-        }
-    except Exception as e:
-        logger.warning(f"Trend OLS forecast failed: {e}")
-        return None
-
-def forecast_seasonal_ols_90(df: pd.DataFrame, date_col: str, value_col: str, target_date: datetime) -> Optional[Dict[str, Any]]:
-    """
-    Seasonal OLS: y = const + beta*t + sum(gamma_m * month_dummies) + e
-    90% CI via statsmodels get_prediction.
-    Also returns aggregated Summer (Jun–Aug) and Winter (Dec–Feb) 2030 forecasts.
-    """
-    try:
-        dfa = df[[date_col, value_col]].dropna().copy()
-        if dfa.empty:
-            return None
-        dfa[date_col] = pd.to_datetime(dfa[date_col])
-        dfa = dfa.sort_values(date_col)
-        dfa["t"] = (dfa[date_col] - dfa[date_col].min()) / np.timedelta64(1, "M")
-        dfa["month"] = dfa[date_col].dt.month.astype(int)
-        # Month dummies (1..12), drop one to avoid multicollinearity
-        month_dummies = pd.get_dummies(dfa["month"], prefix="m", drop_first=True)
-        X = pd.concat([pd.Series(1.0, index=dfa.index, name="const"), dfa["t"], month_dummies], axis=1)
-        y = dfa[value_col].astype(float).values
-        model = sm.OLS(y, X.values).fit()
-
-        # Helper to predict any (year, month)
-        def _predict_y(year: int, month: int):
-            t_val = ((pd.Timestamp(year=year, month=month, day=1) - dfa[date_col].min()) / np.timedelta64(1, "M"))
-            row = {"const": 1.0, "t": float(t_val)}
-            for m in range(2, 13):  # dummies m_2 ... m_12 (m_1 is baseline)
-                row[f"m_{m}"] = 1.0 if month == m else 0.0
-            x_vec = np.array([row.get(col, 0.0) for col in ["const", "t"] + [f"m_{m}" for m in range(2, 13)]])
-            pred = model.get_prediction(x_vec.reshape(1, -1)).summary_frame(alpha=0.10)  # 90% CI
-            return float(pred["mean"].iloc[0]), float(pred["mean_ci_lower"].iloc[0]), float(pred["mean_ci_upper"].iloc[0])
-
-        # Point month forecast:
-        tm = target_date.month
-        point, lo, hi = _predict_y(target_date.year, tm)
-
-        # Seasonal bands for 2030:
-        summer_months = [6, 7, 8]
-        winter_months = [12, 1, 2]
-        summer_preds = [_predict_y(2030, m) for m in summer_months]
-        winter_preds = [_predict_y(2030, m) for m in winter_months]
-        # Average the means and CIs (approximation)
-        summer_point = float(np.mean([p[0] for p in summer_preds]))
-        summer_lo = float(np.mean([p[1] for p in summer_preds]))
-        summer_hi = float(np.mean([p[2] for p in summer_preds]))
-        winter_point = float(np.mean([p[0] for p in winter_preds]))
-        winter_lo = float(np.mean([p[1] for p in winter_preds]))
-        winter_hi = float(np.mean([p[2] for p in winter_preds]))
+        future_t = (pd.to_datetime(target_date) - df[date_col].min()) / np.timedelta64(1, "M")
+        X_future = sm.add_constant(pd.DataFrame({"t": [future_t]}))
+        pred = model.get_prediction(X_future)
+        pred_summary = pred.summary_frame(alpha=0.10)  # 90% CI
 
         return {
             "target_month": target_date.strftime("%Y-%m"),
-            "point": point, "ci_lower": lo, "ci_upper": hi,
-            "summer": {"point": summer_point, "ci_lower": summer_lo, "ci_upper": summer_hi},
-            "winter": {"point": winter_point, "ci_lower": winter_lo, "ci_upper": winter_hi},
-            "r2": float(model.rsquared),
-            "n_obs": int(len(dfa)),
-            "seasonal": True
+            "point": float(pred_summary["mean"].iloc[0]),
+            "90% CI": [float(pred_summary["mean_ci_lower"].iloc[0]), float(pred_summary["mean_ci_upper"].iloc[0])],
+            "slope_per_month": float(model.params["t"]) if "t" in model.params else None,
+            "R²": float(model.rsquared),
+            "n_obs": int(model.nobs),
         }
     except Exception as e:
-        logger.warning(f"Seasonal OLS forecast failed: {e}")
+        logger.error(f"Forecast failed: {e}", exc_info=True)
         return None
 
-def generate_narrative(llm: ChatOpenAI, user_query: str, computed: Dict) -> str:
-    stats_str = "\n- ".join([f"{k}: {v}" for k, v in computed.items()]) if computed else "No stats computed."
-    prompt = f"User query: {user_query}\nComputed Stats:\n- {stats_str}"
-    msg = llm.invoke([{"role": "system", "content": ANALYST_PROMPT}, {"role": "user", "content": prompt}])
-    return getattr(msg, "content", "Could not generate a narrative.").strip()
+def detect_forecast_intent(query: str) -> (bool, Optional[datetime]):
+    q = query.lower()
+    if "forecast" in q or "predict" in q or "estimate" in q:
+        for yr in range(2025, 2040):
+            if str(yr) in q:
+                try:
+                    return True, datetime(yr, 12, 1)
+                except:
+                    pass
+        return True, datetime(2030, 12, 1)
+    return False, None
 
 # --- API Endpoint ---
 @app.get("/healthz")
@@ -282,122 +207,72 @@ def ask(q: Question, x_app_key: str = Header(...)):
         llm = ChatOpenAI(model="gpt-4o", temperature=0, openai_api_key=OPENAI_API_KEY)
         toolkit = SQLDatabaseToolkit(db=db, llm=llm)
 
-        # Agent with callback capture + parse error resilience
-        sql_capture = SQLCaptureHandler()
         agent = create_sql_agent(
             llm=llm,
             toolkit=toolkit,
             verbose=True,
             agent_type="openai-tools",
             system_message=SQL_GENERATOR_PROMPT,
-            top_k=10000,
-            handle_parsing_errors=True,
-            callbacks=[sql_capture],
+            top_k=10000
         )
 
         logger.info("Step 1: Invoking agent to generate SQL.")
         result = agent.invoke({"input": q.query}, return_intermediate_steps=True)
-        sql_query = sql_capture.sql_query
+        sql_query = extract_sql_from_steps(result.get("intermediate_steps", []))
 
-        # Fallback: try extracting from agent output if callback missed it
-        if not sql_query:
-            sql_query = extract_sql_from_text_blob(str(result.get("output", "")))
+        if not sql_query and "output" in result and "SELECT" in str(result["output"]).upper():
+            sql_query = result["output"]
 
-        # Retry with strict prompt if still nothing
         if not sql_query:
-            logger.warning("Agent failed to generate SQL. Retrying with STRICT prompt...")
-            strict_capture = SQLCaptureHandler()
+            logger.warning("Agent failed to generate SQL. Retrying with stricter prompt...")
             strict_agent = create_sql_agent(
                 llm=llm,
                 toolkit=toolkit,
                 verbose=True,
                 agent_type="openai-tools",
                 system_message=STRICT_SQL_PROMPT,
-                top_k=10000,
-                handle_parsing_errors=True,
-                callbacks=[strict_capture],
+                top_k=10000
             )
             result_retry = strict_agent.invoke({"input": q.query}, return_intermediate_steps=True)
-            sql_query = strict_capture.sql_query or extract_sql_from_text_blob(str(result_retry.get("output", "")))
+            sql_query = extract_sql_from_steps(result_retry.get("intermediate_steps", []))
 
         if not sql_query:
             logger.error("Both attempts failed to generate SQL. Falling back to text output.")
             final_answer = result.get("output", "I was unable to formulate a query to answer the question.")
-            final_answer = scrub_schema_mentions(final_answer)
-            # Always append disclaimer
-            final_answer = (final_answer + "\n\nDisclaimer: This is a rough estimate based on a limited set of variables and current trends; it does not account for future structural or policy changes.").strip()
-            return APIResponse(answer=final_answer, execution_time=round(time.time() - start_time, 2))
+        else:
+            safe_sql = clean_and_validate_sql(sql_query)
+            logger.info(f"Step 2: Executing SQL: {safe_sql}")
 
-        safe_sql = clean_and_validate_sql(sql_query)
-        logger.info(f"Step 2: Executing SQL: {safe_sql}")
+            with engine.connect() as conn:
+                cursor_result = conn.execute(text(safe_sql))
+                rows = cursor_result.fetchall()
+                columns = list(cursor_result.keys())
 
-        with engine.connect() as conn:
-            cursor_result = conn.execute(text(safe_sql))
-            rows = cursor_result.fetchall()
-            columns = list(cursor_result.keys())
+            if not rows:
+                final_answer = result.get("output", "The query executed successfully but returned no data.")
+            else:
+                df = coerce_dataframe(rows, columns)
+                computed = {}
 
-        if not rows:
-            final_answer = result.get("output", "The query executed successfully but returned no data.")
-            final_answer = scrub_schema_mentions(final_answer)
-            final_answer = (final_answer + "\n\nDisclaimer: This is a rough estimate based on a limited set of variables and current trends; it does not account for future structural or policy changes.").strip()
-            return APIResponse(answer=final_answer, execution_time=round(time.time() - start_time, 2))
+                do_forecast, target_dt = detect_forecast_intent(q.query)
+                if do_forecast:
+                    candidate_cols = [c for c in df.columns if "price" in c.lower() or "p_bal" in c.lower()]
+                    value_col = candidate_cols[0] if candidate_cols else None
+                    if "date" in df.columns and value_col:
+                        fc = forecast_linear_ols(df, date_col="date", value_col=value_col, target_date=target_dt)
+                        if fc:
+                            computed[f"Balancing Price Forecast ({fc['target_month']})"] = fc
 
-        # --- Analysis & Seasonal Forecast (deterministic) ---
-        df = coerce_dataframe(rows, columns)
+                narrative = llm.invoke([
+                    {"role": "system", "content": ANALYST_PROMPT},
+                    {"role": "user", "content": f"Question: {q.query}\n\nComputed Stats: {computed}"}
+                ])
+                final_answer = narrative.content if hasattr(narrative, "content") else str(narrative)
 
-        forecast_line = ""
-        computed: Dict[str, Any] = {}
-
-        try:
-            # Identify balancing price column; proceed if present with date
-            if "date" in df.columns:
-                df["date"] = pd.to_datetime(df["date"], errors="coerce")
-            value_col = next((c for c in df.columns if c.lower() in ("p_bal_gel", "p_bal", "balancing_price", "price")), None)
-
-            if value_col and "date" in df.columns:
-                # Detect seasonality strength
-                strength = detect_seasonality_strength(df, "date", value_col)
-                is_seasonal = strength >= 0.20  # threshold
-
-                target_dt = datetime(2030, 12, 1)
-
-                if is_seasonal:
-                    fc = forecast_seasonal_ols_90(df, date_col="date", value_col=value_col, target_date=target_dt)
-                    if fc:
-                        forecast_line = (
-                            f"December 2030 forecast: {fc['point']:.2f} GEL/MWh "
-                            f"(90% CI: {fc['ci_lower']:.2f}–{fc['ci_upper']:.2f}); "
-                            f"Seasonality detected (strength≈{strength:.2f}), R²={fc['r2']:.3f}, n={fc['n_obs']}.\n"
-                            f"Seasonal band (2030) — Summer(Jun–Aug): {fc['summer']['point']:.2f} "
-                            f"(90% CI: {fc['summer']['ci_lower']:.2f}–{fc['summer']['ci_upper']:.2f}); "
-                            f"Winter(Dec–Feb): {fc['winter']['point']:.2f} "
-                            f"(90% CI: {fc['winter']['ci_lower']:.2f}–{fc['winter']['ci_upper']:.2f})."
-                        )
-                        computed["Seasonality Strength (0-1)"] = round(strength, 2)
-                else:
-                    fc = forecast_linear_ols_90(df, date_col="date", value_col=value_col, target_date=target_dt)
-                    if fc:
-                        forecast_line = (
-                            f"December 2030 forecast: {fc['point']:.2f} GEL/MWh "
-                            f"(90% CI: {fc['ci_lower']:.2f}–{fc['ci_upper']:.2f}); "
-                            f"Trend-only (no strong seasonality), slope {fc['slope_per_month']:.4f}/month, "
-                            f"R²={fc['r2']:.3f}, n={fc['n_obs']}."
-                        )
-                        computed["Seasonality Strength (0-1)"] = round(strength, 2)
-        except Exception as e:
-            logger.warning(f"Forecast block failed: {e}")
-
-        if forecast_line:
-            computed["Forecast (Dec-2030)"] = forecast_line
-
-        narrative = generate_narrative(llm, q.query, computed)
-        final_answer = (forecast_line + ("\n\n" if forecast_line else "") + narrative).strip()
         final_answer = scrub_schema_mentions(final_answer)
-        # Always append disclaimer
-        final_answer = (final_answer + "\n\nDisclaimer: This is a rough estimate based on a limited set of variables and current trends; it does not account for future structural or policy changes.").strip()
+        final_answer += "\n\nDisclaimer: This is a rough estimate based on a limited number of variables and current trends. It does not account for structural or policy changes that may affect future prices."
 
         return APIResponse(answer=final_answer, execution_time=round(time.time() - start_time, 2))
-
     except Exception as e:
         logger.error(f"FATAL error in /ask endpoint: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="An internal processing error occurred.")
