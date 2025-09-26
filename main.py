@@ -36,7 +36,7 @@ APP_SECRET_KEY = os.getenv("APP_SECRET_KEY")
 if not all([OPENAI_API_KEY, SUPABASE_DB_URL, APP_SECRET_KEY]):
     raise RuntimeError("One or more essential environment variables are missing.")
 
-# --- Import DB Schema & Joins ---
+# --- Import DB Schema & Joins & scrubber from context.py ---
 from context import DB_SCHEMA_DOC, DB_JOINS, scrub_schema_mentions
 
 ALLOWED_TABLES = [
@@ -47,19 +47,20 @@ ALLOWED_TABLES = [
 engine = create_engine(SUPABASE_DB_URL, poolclass=QueuePool, pool_size=10, pool_pre_ping=True)
 db = SQLDatabase(engine, include_tables=ALLOWED_TABLES)
 
-# --- Callback Handler to Capture SQL ---
+# --- Callback Handler to Reliably Capture SQL the Agent Executes ---
 class SQLCaptureHandler(BaseCallbackHandler):
     def __init__(self):
-        self.sql_query = None
+        self.sql_query: Optional[str] = None
 
     def on_agent_action(self, action: AgentAction, **kwargs: Any) -> None:
-        if action.tool == "sql_db_query" and isinstance(action.tool_input, dict):
-            self.sql_query = action.tool_input.get("query")
-        elif action.tool == "sql_db_query" and isinstance(action.tool_input, str):
-            self.sql_query = action.tool_input
+        if action.tool == "sql_db_query":
+            if isinstance(action.tool_input, dict):
+                self.sql_query = action.tool_input.get("query")
+            elif isinstance(action.tool_input, str):
+                self.sql_query = action.tool_input
 
 # --- FastAPI Application ---
-app = FastAPI(title="EnerBot Backend", version="16.8-callback-sql")
+app = FastAPI(title="EnerBot Backend", version="16.12-predict-now")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 # --- System Prompts ---
@@ -110,7 +111,7 @@ class APIResponse(BaseModel):
     answer: str
     execution_time: Optional[float] = None
 
-# --- Core Helper & Analytics Functions ---
+# --- Helpers ---
 def clean_and_validate_sql(sql: str) -> str:
     if not sql:
         raise ValueError("Generated SQL query is empty.")
@@ -121,6 +122,12 @@ def clean_and_validate_sql(sql: str) -> str:
     if not cleaned_sql.strip().upper().startswith("SELECT"):
         raise ValueError("Only SELECT statements are allowed.")
     return cleaned_sql
+
+def extract_sql_from_text_blob(blob: str) -> Optional[str]:
+    if not blob:
+        return None
+    m = re.search(r"SELECT\s+[\s\S]*?;", blob, flags=re.IGNORECASE)
+    return m.group(0) if m else None
 
 def convert_decimal_to_float(obj):
     if isinstance(obj, Decimal): return float(obj)
@@ -137,69 +144,38 @@ def coerce_dataframe(rows: List[tuple], columns: List[str]) -> pd.DataFrame:
             df[col] = df[col].apply(convert_decimal_to_float)
     return df
 
-# --- Forecasting + Analysis Helpers ---
-def extract_series(df: pd.DataFrame) -> Dict[str, pd.DataFrame]:
-    out: Dict[str, pd.DataFrame] = {}
-    if df.empty: return out
-    if "date" in df.columns:
-        df["date"] = pd.to_datetime(df["date"])
-        numeric_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
-        if numeric_cols:
-            for col in numeric_cols:
-                out[col] = df[["date", col]].rename(columns={col: "value"}).sort_values("date").reset_index(drop=True)
-    return out
-
-def analyze_trend(ts: pd.DataFrame) -> Optional[Tuple[str, float]]:
-    if ts.empty or len(ts) < 2: return None
-    first, last = ts["value"].iloc[0], ts["value"].iloc[-1]
-    direction = "increasing" if last > first else "decreasing" if last < first else "stable"
-    pct = ((last - first) / abs(first) * 100) if first != 0 else 0.0
-    return direction, round(pct, 1)
-
+# --- Forecasting ---
 def forecast_linear_ols(df: pd.DataFrame, date_col: str, value_col: str, target_date: datetime) -> Optional[Dict[str, Any]]:
     try:
-        df = df[[date_col, value_col]].dropna()
-        df[date_col] = pd.to_datetime(df[date_col])
-        df["t"] = (df[date_col] - df[date_col].min()) / np.timedelta64(1, "M")
-        X = sm.add_constant(df["t"].values)
-        y = df[value_col].values
+        dfa = df[[date_col, value_col]].dropna().copy()
+        if dfa.empty:
+            return None
+        dfa[date_col] = pd.to_datetime(dfa[date_col])
+        dfa = dfa.sort_values(date_col)
+        # numeric time index in months since start
+        dfa["t"] = (dfa[date_col] - dfa[date_col].min()) / np.timedelta64(1, "M")
+        X = sm.add_constant(dfa["t"].values)
+        y = dfa[value_col].astype(float).values
         model = sm.OLS(y, X).fit()
-        t_future = (pd.to_datetime(target_date) - df[date_col].min()) / np.timedelta64(1, "M")
+        t_future = (pd.to_datetime(target_date) - dfa[date_col].min()) / np.timedelta64(1, "M")
         X_future = sm.add_constant([t_future])
-        pred = model.get_prediction(X_future)
-        mean = float(pred.predicted_mean[0])
-        ci_low, ci_high = [float(x) for x in pred.conf_int()[0]]
+        pred = model.get_prediction(X_future).summary_frame(alpha=0.05)
         return {
             "target_month": target_date.strftime("%Y-%m"),
-            "point": mean,
-            "ci_lower": ci_low,
-            "ci_upper": ci_high,
-            "slope_per_month": model.params[1],
-            "r2": model.rsquared,
-            "n_obs": len(df),
+            "point": float(pred["mean"].iloc[0]),
+            "ci_lower": float(pred["mean_ci_lower"].iloc[0]),
+            "ci_upper": float(pred["mean_ci_upper"].iloc[0]),
+            "slope_per_month": float(model.params[1]),
+            "r2": float(model.rsquared),
+            "n_obs": int(len(dfa)),
         }
     except Exception as e:
         logger.warning(f"Forecast failed: {e}")
         return None
 
-def detect_forecast_intent(query: str) -> Tuple[bool, Optional[datetime]]:
-    q = query.lower()
-    if "forecast" in q or "predict" in q or "estimate" in q:
-        if "2030" in q: return True, datetime(2030, 12, 1)
-    return False, None
-
-def run_full_analysis_pipeline(df: pd.DataFrame, user_query: str) -> Tuple[Dict, str]:
-    series_dict = extract_series(df)
-    computed = {}
-    for name, s in series_dict.items():
-        if "date" in s.columns and not s.empty:
-            if trend := analyze_trend(s): computed[f"{name} Trend"] = f"{trend[0]} ({trend[1]:+g}%)"
-    unit = "GEL" if "price" in user_query.lower() else "TJ"
-    return computed, unit
-
-def generate_final_narrative(llm: ChatOpenAI, user_query: str, unit: str, computed: Dict) -> str:
+def generate_narrative(llm: ChatOpenAI, user_query: str, computed: Dict) -> str:
     stats_str = "\n- ".join([f"{k}: {v}" for k, v in computed.items()]) if computed else "No stats computed."
-    prompt = f"User query: {user_query}\nUnit: {unit}\nComputed Stats:\n- {stats_str}"
+    prompt = f"User query: {user_query}\nComputed Stats:\n- {stats_str}"
     msg = llm.invoke([{"role": "system", "content": ANALYST_PROMPT}, {"role": "user", "content": prompt}])
     return getattr(msg, "content", "Could not generate a narrative.").strip()
 
@@ -217,6 +193,7 @@ def ask(q: Question, x_app_key: str = Header(...)):
         llm = ChatOpenAI(model="gpt-4o", temperature=0, openai_api_key=OPENAI_API_KEY)
         toolkit = SQLDatabaseToolkit(db=db, llm=llm)
 
+        # Agent with callback capture + parse error resilience
         sql_capture = SQLCaptureHandler()
         agent = create_sql_agent(
             llm=llm,
@@ -225,6 +202,7 @@ def ask(q: Question, x_app_key: str = Header(...)):
             agent_type="openai-tools",
             system_message=SQL_GENERATOR_PROMPT,
             top_k=10000,
+            handle_parsing_errors=True,
             callbacks=[sql_capture],
         )
 
@@ -232,9 +210,13 @@ def ask(q: Question, x_app_key: str = Header(...)):
         result = agent.invoke({"input": q.query}, return_intermediate_steps=True)
         sql_query = sql_capture.sql_query
 
-        # Fallback attempt
+        # Fallback: try extracting from agent output if callback missed it
         if not sql_query:
-            logger.warning("Agent failed to generate SQL. Retrying with stricter prompt...")
+            sql_query = extract_sql_from_text_blob(str(result.get("output", "")))
+
+        # Retry with strict prompt if still nothing
+        if not sql_query:
+            logger.warning("Agent failed to generate SQL. Retrying with STRICT prompt...")
             strict_capture = SQLCaptureHandler()
             strict_agent = create_sql_agent(
                 llm=llm,
@@ -243,48 +225,59 @@ def ask(q: Question, x_app_key: str = Header(...)):
                 agent_type="openai-tools",
                 system_message=STRICT_SQL_PROMPT,
                 top_k=10000,
+                handle_parsing_errors=True,
                 callbacks=[strict_capture],
             )
             result_retry = strict_agent.invoke({"input": q.query}, return_intermediate_steps=True)
-            sql_query = strict_capture.sql_query
+            sql_query = strict_capture.sql_query or extract_sql_from_text_blob(str(result_retry.get("output", "")))
 
         if not sql_query:
             logger.error("Both attempts failed to generate SQL. Falling back to text output.")
             final_answer = result.get("output", "I was unable to formulate a query to answer the question.")
-        else:
-            safe_sql = clean_and_validate_sql(sql_query)
-            logger.info(f"Step 2: Executing SQL: {safe_sql}")
+            return APIResponse(answer=scrub_schema_mentions(final_answer), execution_time=round(time.time() - start_time, 2))
 
-            with engine.connect() as conn:
-                cursor_result = conn.execute(text(safe_sql))
-                rows = cursor_result.fetchall()
-                columns = list(cursor_result.keys())
+        safe_sql = clean_and_validate_sql(sql_query)
+        logger.info(f"Step 2: Executing SQL: {safe_sql}")
 
-            if not rows:
-                final_answer = result.get("output", "The query executed successfully but returned no data.")
-            else:
-                df = coerce_dataframe(rows, columns)
-                computed, unit = run_full_analysis_pipeline(df, q.query)
+        with engine.connect() as conn:
+            cursor_result = conn.execute(text(safe_sql))
+            rows = cursor_result.fetchall()
+            columns = list(cursor_result.keys())
 
-                # Forecast if requested
-                do_forecast, target_dt = detect_forecast_intent(q.query)
-                if do_forecast:
-                    if "date" in df.columns:
-                        value_col = next((c for c in df.columns if "p_bal" in c.lower()), None)
-                        if value_col:
-                            fc = forecast_linear_ols(df, date_col="date", value_col=value_col, target_date=target_dt)
-                            if fc:
-                                computed[f"Balancing Price Forecast ({fc['target_month']})"] = {
-                                    "point": round(fc["point"], 2),
-                                    "95% CI": [round(fc["ci_lower"], 2), round(fc["ci_upper"], 2)],
-                                    "slope_per_month": round(fc["slope_per_month"], 4),
-                                    "R²": round(fc["r2"], 3),
-                                    "obs": fc["n_obs"],
-                                }
+        if not rows:
+            final_answer = result.get("output", "The query executed successfully but returned no data.")
+            return APIResponse(answer=scrub_schema_mentions(final_answer), execution_time=round(time.time() - start_time, 2))
 
-                final_answer = generate_final_narrative(llm, q.query, unit, computed)
+        # --- Analysis & Forecast (deterministic) ---
+        df = coerce_dataframe(rows, columns)
+
+        forecast_line = ""
+        try:
+            # If we have balancing price, ALWAYS compute a Dec-2030 forecast
+            if "date" in df.columns:
+                df["date"] = pd.to_datetime(df["date"], errors="coerce")
+            value_col = next((c for c in df.columns if c.lower() in ("p_bal_gel", "p_bal", "balancing_price", "price")), None)
+            if value_col and "date" in df.columns:
+                fc = forecast_linear_ols(df, date_col="date", value_col=value_col, target_date=datetime(2030, 12, 1))
+                if fc:
+                    forecast_line = (
+                        f"Forecast for {fc['target_month']}: {fc['point']:.2f} GEL/MWh "
+                        f"(95% CI: {fc['ci_lower']:.2f}–{fc['ci_upper']:.2f}); "
+                        f"slope {fc['slope_per_month']:.4f}/month, R²={fc['r2']:.3f}, n={fc['n_obs']}."
+                    )
+        except Exception as e:
+            logger.warning(f"Forecast block failed: {e}")
+
+        # Minimal computed stats (optional)
+        computed = {}
+        if forecast_line:
+            computed["Balancing Price Forecast (2030-12)"] = forecast_line
+
+        narrative = generate_narrative(llm, q.query, computed)
+        final_answer = (forecast_line + ("\n" if forecast_line else "") + narrative).strip()
 
         return APIResponse(answer=scrub_schema_mentions(final_answer), execution_time=round(time.time() - start_time, 2))
+
     except Exception as e:
         logger.error(f"FATAL error in /ask endpoint: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="An internal processing error occurred.")
