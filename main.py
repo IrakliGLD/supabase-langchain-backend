@@ -49,7 +49,7 @@ engine = create_engine(SUPABASE_DB_URL, poolclass=QueuePool, pool_size=10, pool_
 db = SQLDatabase(engine, include_tables=ALLOWED_TABLES)
 
 # --- FastAPI Application ---
-app = FastAPI(title="EnerBot Backend", version="17.1-fast-sql")
+app = FastAPI(title="EnerBot Backend", version="17.1-preload-agent")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 # --- System Prompts ---
@@ -192,6 +192,30 @@ def detect_forecast_intent(query: str) -> (bool, Optional[datetime]):
         return True, datetime(2030, 12, 1)
     return False, None
 
+# --- Preload LLMs & Agents at Startup ---
+llm_sql = ChatOpenAI(model="gpt-4o-mini", temperature=0, openai_api_key=OPENAI_API_KEY)
+llm_analyst = ChatOpenAI(model="gpt-4o", temperature=0, openai_api_key=OPENAI_API_KEY)
+
+toolkit = SQLDatabaseToolkit(db=db, llm=llm_sql)
+
+preloaded_agent = create_sql_agent(
+    llm=llm_sql,
+    toolkit=toolkit,
+    verbose=True,
+    agent_type="openai-tools",
+    system_message=SQL_GENERATOR_PROMPT,
+    top_k=1000
+)
+
+strict_agent = create_sql_agent(
+    llm=llm_sql,
+    toolkit=toolkit,
+    verbose=True,
+    agent_type="openai-tools",
+    system_message=STRICT_SQL_PROMPT,
+    top_k=1000
+)
+
 # --- API Endpoint ---
 @app.get("/healthz")
 def health():
@@ -203,37 +227,15 @@ def ask(q: Question, x_app_key: str = Header(...)):
     if x_app_key != APP_SECRET_KEY:
         raise HTTPException(status_code=401, detail="Unauthorized")
     try:
-        # --- Two-model setup ---
-        sql_llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, openai_api_key=OPENAI_API_KEY)
-        analyst_llm = ChatOpenAI(model="gpt-4o", temperature=0, openai_api_key=OPENAI_API_KEY)
-
-        toolkit = SQLDatabaseToolkit(db=db, llm=sql_llm)
-        agent = create_sql_agent(
-            llm=sql_llm,
-            toolkit=toolkit,
-            verbose=True,
-            agent_type="openai-tools",
-            system_message=SQL_GENERATOR_PROMPT,
-            top_k=50  # much lower since schema is preloaded
-        )
-
-        logger.info("Step 1: Invoking agent to generate SQL.")
-        result = agent.invoke({"input": q.query}, return_intermediate_steps=True)
+        logger.info("Step 1: Invoking preloaded agent to generate SQL.")
+        result = preloaded_agent.invoke({"input": q.query}, return_intermediate_steps=True)
         sql_query = extract_sql_from_steps(result.get("intermediate_steps", []))
 
         if not sql_query and "output" in result and "SELECT" in str(result["output"]).upper():
             sql_query = result["output"]
 
         if not sql_query:
-            logger.warning("Agent failed to generate SQL. Retrying with stricter prompt...")
-            strict_agent = create_sql_agent(
-                llm=sql_llm,
-                toolkit=toolkit,
-                verbose=True,
-                agent_type="openai-tools",
-                system_message=STRICT_SQL_PROMPT,
-                top_k=50
-            )
+            logger.warning("Agent failed to generate SQL. Retrying with strict agent...")
             result_retry = strict_agent.invoke({"input": q.query}, return_intermediate_steps=True)
             sql_query = extract_sql_from_steps(result_retry.get("intermediate_steps", []))
 
@@ -264,14 +266,15 @@ def ask(q: Question, x_app_key: str = Header(...)):
                         if fc:
                             computed[f"Balancing Price Forecast ({fc['target_month']})"] = fc
 
-                narrative = analyst_llm.invoke([
+                narrative = llm_analyst.invoke([
                     {"role": "system", "content": ANALYST_PROMPT},
                     {"role": "user", "content": f"Question: {q.query}\n\nComputed Stats: {computed}"}
                 ])
                 final_answer = narrative.content if hasattr(narrative, "content") else str(narrative)
 
         final_answer = scrub_schema_mentions(final_answer)
-        final_answer += "\n\nDisclaimer: This is a rough estimate based on a limited number of variables and current trends. It does not account for structural or policy changes that may affect future prices."
+        if "forecast" in q.query.lower() or "predict" in q.query.lower() or "estimate" in q.query.lower():
+            final_answer += "\n\nDisclaimer: This is a rough estimate based on a limited number of variables and current trends. It does not account for structural or policy changes that may affect future prices."
 
         return APIResponse(answer=final_answer, execution_time=round(time.time() - start_time, 2))
     except Exception as e:
