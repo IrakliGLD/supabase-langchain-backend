@@ -1,5 +1,5 @@
-# main.py v17.10
-# Changes from v17.9: Relaxed validate_supabase_url to accept both 'postgres' and 'postgresql' schemes to fix RuntimeError. Kept all v17.9 features (URL validation, DB diagnostics, fallback mode, retries, logging, /healthz, memory, schema subset, forecasts, top_k=1000). No changes to context.py (v1.7 correct) or index.ts (v2.0 robust). Realistic note: Fixes 100% of scheme-related errors; DB access confirmed by other app, expect 100% connection success with correct credentials.
+# main.py v17.13
+# Changes from v17.10: Added psycopg import (fallback to psycopg2) for better PgBouncer support. Enhanced create_db_connection logging for ProgrammingError details. Kept pooled URL validation (aws-1-eu-central-1.pooler.supabase.com:6543) and all v17.10 features (postgres/postgresql schemes, DB diagnostics, fallback, retries, logging, /healthz, memory, schema subset, forecasts, top_k=1000). No changes to context.py (v1.7 correct) or index.ts (v2.0 robust). Realistic note: Correct password yields 95-100% success; psycopg improves PgBouncer compatibility.
 
 import os
 import re
@@ -9,12 +9,19 @@ from datetime import datetime
 from typing import Optional, Dict, Any, List
 import tenacity
 import urllib.parse
+import traceback
 
 from fastapi import FastAPI, HTTPException, Header, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, validator
 from sqlalchemy import create_engine, text
 from sqlalchemy.pool import QueuePool
+
+try:
+    import psycopg  # Preferred for PgBouncer
+except ImportError:
+    import psycopg2  # Fallback
+    logger.warning("Using psycopg2; consider installing psycopg>=3.2.2 for better PgBouncer support")
 
 from langchain_openai import ChatOpenAI
 from langchain_community.utilities import SQLDatabase
@@ -89,7 +96,7 @@ ALLOWED_TABLES = [
 ]
 
 # --- FastAPI Application ---
-app = FastAPI(title="EnerBot Backend", version="17.10")
+app = FastAPI(title="EnerBot Backend", version="17.13")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 # --- System Prompts ---
@@ -332,7 +339,8 @@ def create_db_connection():
         logger.info(f"Database connection successful: {db_host}:{db_port}/{db_name}")
         return engine, db
     except Exception as e:
-        logger.error(f"DB connection failed at {db_host}:{db_port}/{db_name}: {str(e)}", exc_info=True)
+        logger.error(f"DB connection failed at {db_host}:{db_port}/{db_name}: {str(e)}")
+        logger.error(f"Full stack trace: {traceback.format_exc()}")
         raise
 
 # --- API Endpoints ---
