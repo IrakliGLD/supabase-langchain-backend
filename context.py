@@ -1,7 +1,7 @@
 # === context.py v1.7 ===
-# Changes from v1.6: Added `import os` to fix NameError for os.getenv. No other changes—kept hybrid scrub, schema dict, prose doc, labels, etc. Realistic note: Fix resolves deployment error; no impact on latency/cost since os is standard library.
+# No changes from v1.7: Already fixed os import issue. Error was from main.py DB connection, not context.py. Hybrid scrub, schema dict, prose doc, labels unchanged. Realistic note: No DB calls here, so error is purely from main.py import chain.
 
-import os  # Added to fix NameError
+import os
 import re
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
