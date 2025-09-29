@@ -1,8 +1,6 @@
-# === context.py v1.6-hybrid ===
+# === context.py v1.5 ===
 # Unified schema doc + joins + human-friendly labels + scrubber
-# Changes in v1.6:
-# - Added STRUCTURED_SCHEMA (lightweight) for validation aids
-# - Slightly stronger scrub to reduce leakage of SQL jargon
+
 
 import re
 
@@ -113,7 +111,6 @@ def scrub_schema_mentions(text: str) -> str:
     - Column names -> user-friendly labels.
     - Table names -> user-friendly labels.
     - Encoded categorical values -> natural labels.
-    - Removes common SQL jargon.
     """
     if not text:
         return text
@@ -133,8 +130,7 @@ def scrub_schema_mentions(text: str) -> str:
     # 4) Hide schema/SQL jargon
     schema_terms = [
         "schema", "table", "column", "sql", "join",
-        "primary key", "foreign key", "view", "constraint",
-        "select", "where", "group by", "order by", "limit", "having", "union"
+        "primary key", "foreign key", "view", "constraint"
     ]
     for term in schema_terms:
         text = re.sub(rf"\b{re.escape(term)}\b", "data", text, flags=re.IGNORECASE)
@@ -143,7 +139,7 @@ def scrub_schema_mentions(text: str) -> str:
     return text.replace("```", "").strip()
 
 
-# === DB_SCHEMA_DOC v1.5 (unchanged narrative block) ===
+# === DB_SCHEMA_DOC v1.5 ===
 DB_SCHEMA_DOC = """
 ### Global Rules & Conversions ###
 - **General Rule:** Provide summaries and insights only. Do NOT return raw data, full tables, or row-level dumps. If asked for a dump, refuse and suggest an aggregated view instead.
@@ -161,7 +157,7 @@ DB_SCHEMA_DOC = """
 ...
 """
 
-# === DB_JOINS v1.4 (unchanged) ===
+# === DB_JOINS v1.4 ===
 DB_JOINS = {
     "dates": {"join_on": "date", "related_to": ["price", "monthly_cpi", "tech_quantity", "trade", "tariff_gen"]},
     "energy_balance_long": {"join_on": "year", "related_to": ["tech_quantity", "price", "monthly_cpi", "trade"]},
@@ -171,14 +167,4 @@ DB_JOINS = {
     "tariff_gen": {"join_on": ["date", "entity"], "related_to": ["entities", "trade", "price", "tech_quantity"]},
     "entities": {"join_on": "entity", "related_to": ["tariff_gen", "trade"]},
     "monthly_cpi": {"join_on": "date", "related_to": ["price", "tech_quantity", "energy_balance_long"]},
-}
-
-# --- Lightweight structured schema for validation aids (no new tables added) ---
-STRUCTURED_SCHEMA = {
-    "tables": [
-        "energy_balance_long", "entities", "monthly_cpi",
-        "price", "tariff_gen", "tech_quantity", "trade", "dates"
-    ],
-    # columns are unioned; per-table exact mapping is intentionally light
-    "columns": sorted(set(COLUMN_LABELS.keys())),
 }
