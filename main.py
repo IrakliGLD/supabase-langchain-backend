@@ -1,5 +1,5 @@
-# main.py v17.7-prompt-composed
-# Changes from v17.6: Fixed TypeError by embedding FEW_SHOT_EXAMPLES into SQL_SYSTEM_TEMPLATE, removing invalid concatenation of FewShotChatMessagePromptTemplate and ChatPromptTemplate. Added try/except for prompt creation with fallback. Kept all v17.6 features (lazy DB init, retries, logging, /healthz, memory, schema subset, forecasts, top_k=1000). No changes to context.py (v1.7 correct). Realistic note: Fixes 100% of prompt-related errors; ensures /ask returns valid JSON, resolving Edge Function error. If DB issues return, check SUPABASE_DB_URL (?pgbouncer=true, port 6543) and Supabase IP whitelist.
+# main.py v17.9-db-validate
+# Changes from v17.8: Added SUPABASE_DB_URL validation at startup (checks pgbouncer=true, host, port, credentials). Enhanced fallback mode to return schema-based responses on DB failure, ensuring valid JSON for Edge Function. Kept all v17.8 features (prompt composition, lazy DB init, retries, logging, /healthz, memory, schema subset, forecasts, top_k=1000). No changes to context.py (v1.7 correct). Realistic note: Fixes 503 crash by validating env; DB issue requires correct SUPABASE_DB_URL (?pgbouncer=true, port 6543) and Render IP whitelisting in Supabase.
 
 import os
 import re
@@ -8,6 +8,7 @@ import time
 from datetime import datetime
 from typing import Optional, Dict, Any, List
 import tenacity
+import urllib.parse
 
 from fastapi import FastAPI, HTTPException, Header, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -44,9 +45,40 @@ APP_SECRET_KEY = os.getenv("APP_SECRET_KEY")
 if not all([OPENAI_API_KEY, SUPABASE_DB_URL, APP_SECRET_KEY]):
     raise RuntimeError("One or more essential environment variables are missing.")
 
+# Validate SUPABASE_DB_URL
+def validate_supabase_url(url: str) -> None:
+    try:
+        parsed = urllib.parse.urlparse(url)
+        if parsed.scheme != "postgres":
+            raise ValueError("Scheme must be 'postgres'")
+        if not parsed.username or not parsed.password:
+            raise ValueError("Username and password must be provided")
+        if parsed.hostname != "aws-1-eu-central-1.pooler.supabase.com":
+            raise ValueError("Host must be 'aws-1-eu-central-1.pooler.supabase.com'")
+        if parsed.port != 6543:
+            raise ValueError("Port must be 6543 for pooled connection")
+        if parsed.path != "/postgres":
+            raise ValueError("Database path must be '/postgres'")
+        params = urllib.parse.parse_qs(parsed.query)
+        if params.get("pgbouncer") != ["true"]:
+            raise ValueError("Query parameter 'pgbouncer=true' is required")
+        if params.get("sslmode") != ["require"]:
+            raise ValueError("Query parameter 'sslmode=require' is required")
+    except Exception as e:
+        logger.error(f"Invalid SUPABASE_DB_URL: {str(e)}")
+        raise RuntimeError(f"Invalid SUPABASE_DB_URL: {str(e)}")
+validate_supabase_url(SUPABASE_DB_URL)
+
 # Sanitized DB URL for logging (hide password)
 sanitized_db_url = re.sub(r':[^@]+@', ':****@', SUPABASE_DB_URL)
 logger.info(f"Using SUPABASE_DB_URL: {sanitized_db_url}")
+
+# Parse DB URL for diagnostics
+parsed_db_url = urllib.parse.urlparse(SUPABASE_DB_URL)
+db_host = parsed_db_url.hostname
+db_port = parsed_db_url.port
+db_name = parsed_db_url.path.lstrip('/')
+logger.info(f"DB connection details: host={db_host}, port={db_port}, dbname={db_name}")
 
 # --- Import DB Schema & Joins ---
 from context import DB_SCHEMA_DOC, DB_JOINS, scrub_schema_mentions
@@ -57,7 +89,7 @@ ALLOWED_TABLES = [
 ]
 
 # --- FastAPI Application ---
-app = FastAPI(title="EnerBot Backend", version="17.7-prompt-composed")
+app = FastAPI(title="EnerBot Backend", version="17.9-db-validate")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 # --- System Prompts ---
@@ -111,6 +143,7 @@ AGENT_PROMPT = ChatPromptTemplate.from_messages([
     Restrictions:
     - Only forecast prices, CPI, demand. Block generation/import/export forecasts.
     - If visualization needed, output JSON for charts (e.g., {'type': 'line', 'data': [...]}).
+    - If database is unavailable, provide a schema-based response without data.
     
     Schema: {schema}
     Joins: {joins}
@@ -269,7 +302,7 @@ def execute_python_code(code: str) -> str:
 # --- New: Schema Subsetter ---
 def get_schema_subset(llm, query: str) -> str:
     subset_prompt = ChatPromptTemplate.from_messages([
-        ("system", "Extract relevant tables/columns from schema for query. Output concise subset doc."),
+        ("system", "Extract relevant tables/columns from schema for query. Output concise subset doc. If database unavailable, describe schema without data access."),
         ("human", f"Query: {query}\nFull Schema: {DB_SCHEMA_DOC}"),
     ])
     chain = subset_prompt | llm | StrOutputParser()
@@ -296,12 +329,10 @@ def create_db_connection():
         # Test connection
         with engine.connect() as conn:
             conn.execute(text("SELECT 1"))
-        logger.info("Database connection successful")
+        logger.info(f"Database connection successful: {db_host}:{db_port}/{db_name}")
         return engine, db
     except Exception as e:
-        host = re.search(r'@([^:]+):(\d+)/', SUPABASE_DB_URL)
-        host_info = f"host={host.group(1)}:{host.group(2)}" if host else "unknown host"
-        logger.error(f"DB connection failed at {host_info}: {str(e)}")
+        logger.error(f"DB connection failed at {db_host}:{db_port}/{db_name}: {str(e)}", exc_info=True)
         raise
 
 # --- API Endpoints ---
@@ -314,7 +345,7 @@ def health(check_db: Optional[bool] = Query(False)):
                 conn.execute(text("SELECT 1"))
             return {"status": "ok", "db_status": "connected"}
         except Exception as e:
-            logger.error(f"Health check DB connection failed: {e}")
+            logger.error(f"Health check DB connection failed: {str(e)}", exc_info=True)
             return {"status": "ok", "db_status": f"failed: {str(e)}"}
     return {"status": "ok"}
 
@@ -325,11 +356,13 @@ def ask(q: Question, x_app_key: str = Header(...)):
         raise HTTPException(status_code=401, detail="Unauthorized")
     try:
         # Lazy DB init with retries
+        engine, db = None, None
+        db_error = None
         try:
             engine, db = create_db_connection()
         except Exception as e:
-            logger.error(f"Failed to connect to database: {e}")
-            raise HTTPException(status_code=503, detail="Database connection failed. Please try again later.")
+            db_error = str(e)
+            logger.warning(f"DB connection failed, proceeding in fallback mode: {db_error}")
 
         llm = ChatOpenAI(model="gpt-4o", temperature=0, openai_api_key=OPENAI_API_KEY)
         
@@ -358,8 +391,9 @@ def ask(q: Question, x_app_key: str = Header(...)):
         ])
         
         # Multi-tool agent with memory
-        tools = db.get_usable_table_names()  # SQL tools implicit
-        tools.append(execute_python_code)  # Add code tool
+        tools = [execute_python_code]  # Default to code tool
+        if db:
+            tools.extend(db.get_usable_table_names())  # Add SQL tools if DB connected
         
         agent = create_openai_tools_agent(
             llm=llm,
@@ -384,8 +418,11 @@ def ask(q: Question, x_app_key: str = Header(...)):
         last_error = None
         for attempt in range(3):
             try:
+                input_query = q.query
+                if db_error and "select" in q.query.lower():
+                    input_query = f"{q.query}\nNote: Database is unavailable, provide a schema-based response without data."
                 result = agent_executor.invoke({
-                    "input": q.query + (f"\nPrevious error: {last_error}" if last_error else ""),
+                    "input": input_query + (f"\nPrevious error: {last_error}" if last_error else ""),
                     "schema": schema_subset,
                     "joins": DB_JOINS
                 })
@@ -398,6 +435,10 @@ def ask(q: Question, x_app_key: str = Header(...)):
             raise ValueError("Agent failed after retries.")
         
         raw_output = result.get("output", "Unable to process.")
+        
+        # Append DB warning if applicable
+        if db_error:
+            raw_output = f"Warning: Database connection failed ({db_error}). Results are schema-based and may lack data. {raw_output}"
         
         # Parse for charts
         chart_data = None
@@ -418,8 +459,8 @@ def ask(q: Question, x_app_key: str = Header(...)):
         if blocked_reason:
             final_answer = "I can only analyze historical data. " + blocked_reason
         else:
-            # Run forecast if detected and not blocked
-            if do_forecast:
+            # Run forecast if detected, not blocked, and DB available
+            if do_forecast and db:
                 # Extract data from agent steps if available
                 sql_query = extract_sql_from_steps(result.get("intermediate_steps", []))
                 if sql_query:
@@ -437,6 +478,7 @@ def ask(q: Question, x_app_key: str = Header(...)):
                                         raw_output += f"\nForecast: {json.dumps(fc)}"
                     except Exception as e:
                         logger.warning(f"Forecast SQL execution failed: {e}")
+                        raw_output += f"\nWarning: Forecast failed due to database error ({str(e)})."
 
         final_answer = scrub_schema_mentions(raw_output)
 
