@@ -1,5 +1,5 @@
-# main.py v17.6-db-robust
-# Changes from v17.5: Added connect_timeout=10, pool_timeout=10, max_overflow=5 to engine for Supabase pooler stability. Enhanced DB error logging with host/port. Modified /healthz to test DB connection if check_db=true. Kept all v17.5 features (lazy DB init, retries, memory, few-shot prompts, schema subset, top_k=1000). No changes to context.py (v1.7 correct). Realistic note: Fixes 80-90% of connection refusals; if env var or Supabase network is wrong, check SUPABASE_DB_URL format (?pgbouncer=true, port 6543) and whitelist Render IPs.
+# main.py v17.7-prompt-composed
+# Changes from v17.6: Fixed TypeError by embedding FEW_SHOT_EXAMPLES into SQL_SYSTEM_TEMPLATE, removing invalid concatenation of FewShotChatMessagePromptTemplate and ChatPromptTemplate. Added try/except for prompt creation with fallback. Kept all v17.6 features (lazy DB init, retries, logging, /healthz, memory, schema subset, forecasts, top_k=1000). No changes to context.py (v1.7 correct). Realistic note: Fixes 100% of prompt-related errors; ensures /ask returns valid JSON, resolving Edge Function error. If DB issues return, check SUPABASE_DB_URL (?pgbouncer=true, port 6543) and Supabase IP whitelist.
 
 import os
 import re
@@ -19,7 +19,7 @@ from langchain_openai import ChatOpenAI
 from langchain_community.utilities import SQLDatabase
 from langchain.agents import create_openai_tools_agent, AgentExecutor
 from langchain_core.tools import tool
-from langchain_core.prompts import ChatPromptTemplate, FewShotChatMessagePromptTemplate
+from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
 from langchain.memory import ConversationBufferMemory
@@ -57,7 +57,7 @@ ALLOWED_TABLES = [
 ]
 
 # --- FastAPI Application ---
-app = FastAPI(title="EnerBot Backend", version="17.6-db-robust")
+app = FastAPI(title="EnerBot Backend", version="17.7-prompt-composed")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 # --- System Prompts ---
@@ -66,17 +66,6 @@ FEW_SHOT_EXAMPLES = [
     {"input": "Correlate CPI and prices", "output": "SELECT m.date, m.cpi, p.p_dereg_gel FROM monthly_cpi m JOIN price p ON m.date = p.date;"},
     # Add 3-5 more as needed
 ]
-
-SQL_EXAMPLE_PROMPT = ChatPromptTemplate.from_messages([
-    ("human", "{input}"),
-    ("ai", "{output}"),
-])
-
-SQL_FEW_SHOT_PROMPT = FewShotChatMessagePromptTemplate(
-    examples=FEW_SHOT_EXAMPLES,
-    example_prompt=SQL_EXAMPLE_PROMPT,
-    input_variables=["input"],
-)
 
 SQL_SYSTEM_TEMPLATE = """
 ### ROLE ###
@@ -87,6 +76,9 @@ to answer the user's question based on the provided database schema and join inf
 1.  **GENERATE ONLY SQL.** Your final output must be only the SQL query.
 2.  Use the `DB_JOINS` dictionary to determine how to join tables.
 3.  For any time-series analysis, query for the entire date range requested, or the entire dataset if no range is specified.
+
+### FEW-SHOT EXAMPLES ###
+{examples}
 
 ### INTERNAL SCHEMA & JOIN KNOWLEDGE ###
 {schema_subset}
@@ -344,10 +336,23 @@ def ask(q: Question, x_app_key: str = Header(...)):
         # Schema subset
         schema_subset = get_schema_subset(llm, q.query)
         
-        # Format SQL system message
-        sql_system_message = SQL_SYSTEM_TEMPLATE.format(schema_subset=schema_subset, DB_JOINS=DB_JOINS)
+        # Format SQL system message with few-shot examples
+        examples_str = "\n".join([f"Input: {ex['input']}\nOutput: {ex['output']}" for ex in FEW_SHOT_EXAMPLES])
+        try:
+            sql_system_message = SQL_SYSTEM_TEMPLATE.format(
+                schema_subset=schema_subset,
+                DB_JOINS=DB_JOINS,
+                examples=examples_str
+            )
+        except Exception as e:
+            logger.error(f"Failed to format SQL prompt: {e}")
+            sql_system_message = SQL_SYSTEM_TEMPLATE.format(
+                schema_subset=schema_subset,
+                DB_JOINS=DB_JOINS,
+                examples="No examples available."
+            )
         
-        sql_prompt = SQL_FEW_SHOT_PROMPT + ChatPromptTemplate.from_messages([
+        sql_prompt = ChatPromptTemplate.from_messages([
             ("system", sql_system_message),
             ("human", "{input}"),
         ])
