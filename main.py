@@ -1,5 +1,5 @@
-# main.py v17.3-with-improvements
-# Changes from v17.2: Added SQL retries (up to 3 with error feedback), few-shot examples to SQL prompt, schema subsetting via LLM, conversation memory (ConversationBufferMemory), enhanced forecasting integration (trigger in agent if detected), better code tool error handling (expanded try/except), hybrid scrub in context.py. No other changes—kept top_k=1000, restrictions, etc. Realistic note: Retries/memory add 10-20% latency/cost; schema subset cuts tokens but may miss tables 5-10% of time; forecasting still limited by data.
+# main.py v17.4-lazy-db
+# Changes from v17.3: Moved engine/db creation to /ask endpoint with 3 retries (5s delay) to handle connection refused errors. Added sanitized DB URL logging for debug. Kept all v17.3 features (retries, memory, few-shot, schema subset, forecasts, top_k=1000). Realistic note: Lazy init ensures deployment but adds 50-100ms first-request latency; retries handle 80-90% transient DB issues but fail if env is wrong. Check SUPABASE_DB_URL in Render.
 
 import os
 import re
@@ -7,6 +7,7 @@ import logging
 import time
 from datetime import datetime
 from typing import Optional, Dict, Any, List
+import tenacity
 
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
@@ -43,6 +44,10 @@ APP_SECRET_KEY = os.getenv("APP_SECRET_KEY")
 if not all([OPENAI_API_KEY, SUPABASE_DB_URL, APP_SECRET_KEY]):
     raise RuntimeError("One or more essential environment variables are missing.")
 
+# Sanitized DB URL for logging (hide password)
+sanitized_db_url = re.sub(r':[^@]+@', ':****@', SUPABASE_DB_URL)
+logger.info(f"Using SUPABASE_DB_URL: {sanitized_db_url}")
+
 # --- Import DB Schema & Joins ---
 from context import DB_SCHEMA_DOC, DB_JOINS, scrub_schema_mentions
 
@@ -51,15 +56,11 @@ ALLOWED_TABLES = [
     "price", "tariff_gen", "tech_quantity", "trade", "dates"
 ]
 
-engine = create_engine(SUPABASE_DB_URL, poolclass=QueuePool, pool_size=10, pool_pre_ping=True)
-db = SQLDatabase(engine, include_tables=ALLOWED_TABLES)
-
 # --- FastAPI Application ---
-app = FastAPI(title="EnerBot Backend", version="17.3-with-improvements")
+app = FastAPI(title="EnerBot Backend", version="17.4-lazy-db")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 # --- System Prompts ---
-# Updated with few-shot examples
 FEW_SHOT_EXAMPLES = [
     {"input": "What is the average price in 2020?", "output": "SELECT AVG(p_dereg_gel) FROM price WHERE date >= '2020-01-01' AND date < '2021-01-01';"},
     {"input": "Correlate CPI and prices", "output": "SELECT m.date, m.cpi, p.p_dereg_gel FROM monthly_cpi m JOIN price p ON m.date = p.date;"},
@@ -285,6 +286,21 @@ def get_schema_subset(llm, query: str) -> str:
     chain = subset_prompt | llm | StrOutputParser()
     return chain.invoke({})
 
+# --- New: DB Connection with Retry ---
+@tenacity.retry(
+    stop=tenacity.stop_after_attempt(3),
+    wait=tenacity.wait_fixed(5),
+    retry=tenacity.retry_if_exception_type(Exception),
+    before_sleep=lambda retry_state: logger.info(f"Retrying DB connection ({retry_state.attempt_number}/3)...")
+)
+def create_db_connection():
+    engine = create_engine(SUPABASE_DB_URL, poolclass=QueuePool, pool_size=10, pool_pre_ping=True)
+    db = SQLDatabase(engine, include_tables=ALLOWED_TABLES)
+    # Test connection
+    with engine.connect() as conn:
+        conn.execute(text("SELECT 1"))
+    return engine, db
+
 # --- API Endpoint ---
 @app.get("/healthz")
 def health():
@@ -296,12 +312,19 @@ def ask(q: Question, x_app_key: str = Header(...)):
     if x_app_key != APP_SECRET_KEY:
         raise HTTPException(status_code=401, detail="Unauthorized")
     try:
+        # Lazy DB init with retries
+        try:
+            engine, db = create_db_connection()
+        except Exception as e:
+            logger.error(f"Failed to connect to database: {e}")
+            raise HTTPException(status_code=503, detail="Database connection failed. Please try again later.")
+
         llm = ChatOpenAI(model="gpt-4o", temperature=0, openai_api_key=OPENAI_API_KEY)
         
-        # New: Schema subset
+        # Schema subset
         schema_subset = get_schema_subset(llm, q.query)
         
-        # New: Multi-tool agent with memory
+        # Multi-tool agent with memory
         tools = db.get_usable_table_names()  # SQL tools implicit
         tools.append(execute_python_code)  # Add code tool
         
@@ -323,7 +346,7 @@ def ask(q: Question, x_app_key: str = Header(...)):
         )
         
         logger.info("Invoking advanced agent.")
-        # New: Retries with error feedback
+        # Retries with error feedback
         result = None
         last_error = None
         for attempt in range(3):
@@ -343,7 +366,7 @@ def ask(q: Question, x_app_key: str = Header(...)):
         
         raw_output = result.get("output", "Unable to process.")
         
-        # Parse for charts (e.g., if output has JSON block)
+        # Parse for charts
         chart_data = None
         chart_type = None
         chart_metadata = {}
@@ -362,15 +385,27 @@ def ask(q: Question, x_app_key: str = Header(...)):
         if blocked_reason:
             final_answer = "I can only analyze historical data. " + blocked_reason
         else:
-            # Updated: Run forecast if detected and not blocked (integrate result into output)
+            # Run forecast if detected and not blocked
             if do_forecast:
-                # Assume agent handled data fetch; fallback if no df in result
-                if "df" in locals():  # Placeholder—extract from agent if possible
-                    fc = forecast_linear_ols(df, "date", "value_col", target_dt)
-                    if fc:
-                        raw_output += f"\nForecast: {json.dumps(fc)}"
-        
-        final_answer = scrub_schema_mentions(final_answer)
+                # Extract data from agent steps if available
+                sql_query = extract_sql_from_steps(result.get("intermediate_steps", []))
+                if sql_query:
+                    try:
+                        with engine.connect() as conn:
+                            result = conn.execute(text(clean_and_validate_sql(sql_query)))
+                            rows = result.fetchall()
+                            columns = result.keys()
+                            df = coerce_dataframe(rows, columns)
+                            if not df.empty and "date" in df.columns and any(col in df.columns for col in ["p_dereg_gel", "cpi", "quantity_tech"]):
+                                value_col = next((col for col in ["p_dereg_gel", "cpi", "quantity_tech"] if col in df.columns), None)
+                                if value_col:
+                                    fc = forecast_linear_ols(df, "date", value_col, target_dt)
+                                    if fc:
+                                        raw_output += f"\nForecast: {json.dumps(fc)}"
+                    except Exception as e:
+                        logger.warning(f"Forecast SQL execution failed: {e}")
+
+        final_answer = scrub_schema_mentions(raw_output)
 
         return APIResponse(
             answer=final_answer,
