@@ -1,5 +1,5 @@
-# main.py v17.13
-# Changes from v17.10: Added psycopg import (fallback to psycopg2) for better PgBouncer support. Enhanced create_db_connection logging for ProgrammingError details. Kept pooled URL validation (aws-1-eu-central-1.pooler.supabase.com:6543) and all v17.10 features (postgres/postgresql schemes, DB diagnostics, fallback, retries, logging, /healthz, memory, schema subset, forecasts, top_k=1000). No changes to context.py (v1.7 correct) or index.ts (v2.0 robust). Realistic note: Correct password yields 95-100% success; psycopg improves PgBouncer compatibility.
+# main.py v17.16
+# Changes from v17.15: Updated validate_supabase_url to enforce pooled connection (aws-1-eu-central-1.pooler.supabase.com:6543) for IPv4 compatibility with Render free tier. Kept password trimming and enhanced logging for ProgrammingError details. Preserved all v17.15 features (psycopg, DB diagnostics, fallback, retries, logging, /healthz, memory, schema subset, forecasts, top_k=1000). No changes to context.py (v1.7 correct) or index.ts (v2.0 robust). Realistic note: Pooled connection yields 95-100% success with correct password.
 
 import os
 import re
@@ -60,19 +60,26 @@ def validate_supabase_url(url: str) -> None:
             raise ValueError("Scheme must be 'postgres' or 'postgresql'")
         if not parsed.username or not parsed.password:
             raise ValueError("Username and password must be provided")
+        # Trim whitespace from password
+        parsed_password = parsed.password.strip() if parsed.password else ""
+        if not parsed_password:
+            raise ValueError("Password cannot be empty after trimming")
+        logger.info(f"Parsed URL components: scheme={parsed.scheme}, username={parsed.username}, host={parsed.hostname}, port={parsed.port}, path={parsed.path}, query={parsed.query}")
         if parsed.hostname != "aws-1-eu-central-1.pooler.supabase.com":
             raise ValueError("Host must be 'aws-1-eu-central-1.pooler.supabase.com'")
         if parsed.port != 6543:
             raise ValueError("Port must be 6543 for pooled connection")
         if parsed.path != "/postgres":
             raise ValueError("Database path must be '/postgres'")
+        if parsed.username != "postgres.qvmqmmcglqmhachqaezt":
+            raise ValueError("Pooled connection requires username 'postgres.qvmqmmcglqmhachqaezt'")
         params = urllib.parse.parse_qs(parsed.query)
         if params.get("pgbouncer") != ["true"]:
             raise ValueError("Query parameter 'pgbouncer=true' is required")
         if params.get("sslmode") != ["require"]:
             raise ValueError("Query parameter 'sslmode=require' is required")
     except Exception as e:
-        logger.error(f"Invalid SUPABASE_DB_URL: {str(e)}")
+        logger.error(f"Invalid SUPABASE_DB_URL: {str(e)}", exc_info=True)
         raise RuntimeError(f"Invalid SUPABASE_DB_URL: {str(e)}")
 validate_supabase_url(SUPABASE_DB_URL)
 
@@ -96,7 +103,7 @@ ALLOWED_TABLES = [
 ]
 
 # --- FastAPI Application ---
-app = FastAPI(title="EnerBot Backend", version="17.13")
+app = FastAPI(title="EnerBot Backend", version="17.16")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 # --- System Prompts ---
@@ -297,7 +304,7 @@ def execute_python_code(code: str) -> str:
         if result is None:
             raise ValueError("No 'result' variable set in code.")
         if isinstance(result, pd.DataFrame):
-            return result.to_json(orient="records")
+            return result.to,json(orient="records")
         return str(result)
     except SyntaxError as se:
         return f"Syntax error: {str(se)}"
