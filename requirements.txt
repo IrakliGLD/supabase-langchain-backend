@@ -7,7 +7,7 @@ langchain==0.3.2
 langchain-openai==0.2.2
 langchain-community==0.3.1
 pydantic==2.9.2
-tenacity==9.0.0
+tenacity==8.5.0  # Changed from 9.0.0 to resolve conflict with langchain==0.3.2
 pandas==2.2.3
 numpy==2.1.1
 statsmodels==0.14.4
