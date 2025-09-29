@@ -1,6 +1,7 @@
 # main.py v17.13
 # Changes from v17.10: Added psycopg import (fallback to psycopg2) for better PgBouncer support. Enhanced create_db_connection logging for ProgrammingError details. Kept pooled URL validation (aws-1-eu-central-1.pooler.supabase.com:6543) and all v17.10 features (postgres/postgresql schemes, DB diagnostics, fallback, retries, logging, /healthz, memory, schema subset, forecasts, top_k=1000). No changes to context.py (v1.7 correct) or index.ts (v2.0 robust). Realistic note: Correct password yields 95-100% success; psycopg improves PgBouncer compatibility.
 
+
 import os
 import re
 import logging
