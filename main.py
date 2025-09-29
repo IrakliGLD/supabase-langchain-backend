@@ -1,12 +1,11 @@
-# === main.py v18.0-hybrid ===
-# Changes in v18:
-# - Hybrid forecast intent: keyword prefilter + optional LLM confirmation
-# - Faster SQL: single-shot generation with validation + auto-correct on error
-# - Schema/table pre-validation (tables) and error-driven retry (columns)
-# - Compact analytics: summary stats + correlation instead of raw row dumps
-# - Optional structured chart payload in API response
-# - Safer error messaging
-# - Backward compatible with your frontend (answer, data, chartMetadata, chartType)
+# === main.py v18.1-diagnostics ===
+# Changes vs v18.0-hybrid:
+# - Enforce sslmode=require and add connect_timeout to the DB URL
+# - Smaller, safer pool config (pgbouncer-friendly)
+# - Added /db_ping endpoint to test DB connectivity
+# - Added /diag endpoint (sanitized) to verify effective DB URL/sslmode
+# - Optional debug error reveal via DEBUG_ERRORS env or X-Debug header
+# - No behavioral changes to the hybrid analysis flow
 
 import os
 import re
@@ -20,6 +19,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, validator
 from sqlalchemy import create_engine, text
 from sqlalchemy.pool import QueuePool
+from sqlalchemy.engine.url import make_url
 
 from langchain_openai import ChatOpenAI
 
@@ -36,10 +36,11 @@ logger = logging.getLogger("enerbot")
 
 load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-SUPABASE_DB_URL = os.getenv("SUPABASE_DB_URL")
+SUPABASE_DB_URL_RAW = os.getenv("SUPABASE_DB_URL")
 APP_SECRET_KEY = os.getenv("APP_SECRET_KEY")
+DEBUG_ERRORS = os.getenv("DEBUG_ERRORS", "false").lower() in ("1", "true", "yes")
 
-if not all([OPENAI_API_KEY, SUPABASE_DB_URL, APP_SECRET_KEY]):
+if not all([OPENAI_API_KEY, SUPABASE_DB_URL_RAW, APP_SECRET_KEY]):
     raise RuntimeError("One or more essential environment variables are missing.")
 
 # --- Import DB Schema & Joins ---
@@ -48,10 +49,30 @@ from context import DB_SCHEMA_DOC, DB_JOINS, STRUCTURED_SCHEMA, COLUMN_LABELS, s
 ALLOWED_TABLES = STRUCTURED_SCHEMA["tables"]
 ALLOWED_COLUMNS = set(STRUCTURED_SCHEMA["columns"])
 
-engine = create_engine(SUPABASE_DB_URL, poolclass=QueuePool, pool_size=10, pool_pre_ping=True)
+# --- DB URL normalization (force SSL, add connect timeout) ---
+def _normalize_db_url(u: str) -> str:
+    if not u:
+        return u
+    if "sslmode=" not in u:
+        u += ("&" if "?" in u else "?") + "sslmode=require"
+    if "connect_timeout=" not in u:
+        u += ("&" if "?" in u else "?") + "connect_timeout=8"
+    return u
+
+SUPABASE_DB_URL = _normalize_db_url(SUPABASE_DB_URL_RAW)
+
+# --- SQLAlchemy Engine ---
+engine = create_engine(
+    SUPABASE_DB_URL,
+    poolclass=QueuePool,
+    pool_size=5,
+    max_overflow=2,
+    pool_pre_ping=True,
+    pool_recycle=1800,  # recycle stale conns; pgbouncer-friendly
+)
 
 # --- FastAPI Application ---
-app = FastAPI(title="EnerBot Backend", version="18.0-hybrid")
+app = FastAPI(title="EnerBot Backend", version="18.1-diagnostics")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 # --- System Prompts ---
@@ -103,7 +124,6 @@ class Question(BaseModel):
 class APIResponse(BaseModel):
     answer: str
     execution_time: Optional[float] = None
-    # Optional structured chart payload (frontend already expects these fields)
     data: Optional[Any] = None
     chartType: Optional[str] = None
     chartMetadata: Optional[Dict[str, Any]] = None
@@ -117,7 +137,6 @@ def clean_and_validate_sql(sql: str) -> str:
     cleaned_sql = cleaned_sql.strip().removesuffix(";")
     if not cleaned_sql.strip().upper().startswith("SELECT"):
         raise ValueError("Only SELECT statements are allowed.")
-    # precheck for disallowed statements
     forbidden = [" INSERT ", " UPDATE ", " DELETE ", " DROP ", " ALTER ", " CREATE ", " MERGE "]
     up = f" {cleaned_sql.upper()} "
     if any(tok in up for tok in forbidden):
@@ -184,14 +203,12 @@ def forecast_linear_ols(df: pd.DataFrame, date_col: str, value_col: str, target_
     try:
         df = _ensure_monthly_index(df, date_col, value_col)
         if df.shape[0] < 12:
-            # not enough history
             return None
 
         df["t"] = (df[date_col] - df[date_col].min()) / np.timedelta64(1, "M")
         X = sm.add_constant(df["t"])
         y = df[value_col]
 
-        # Try seasonal STL first
         try:
             stl = STL(y, period=12, robust=True)
             res = stl.fit()
@@ -229,12 +246,10 @@ def _keyword_maybe_forecast(q: str) -> bool:
 
 def _extract_target_date(q: str, latest_date: Optional[pd.Timestamp]) -> datetime:
     ql = q.lower()
-    # Absolute year like 2030
     m = re.search(r"\b(20[2-5]\d)\b", ql)
     if m:
         year = int(m.group(1))
         return datetime(year, 12, 1)
-    # Relative "in X years/months"
     m = re.search(r"\bin\s+(\d+)\s+(years?|months?)\b", ql)
     if m and latest_date is not None:
         n = int(m.group(1))
@@ -243,11 +258,9 @@ def _extract_target_date(q: str, latest_date: Optional[pd.Timestamp]) -> datetim
         if "year" in unit:
             return (base + timedelta(days=365 * n)).replace(day=1)
         return (base + timedelta(days=30 * n)).replace(day=1)
-    # Default
     return datetime(2030, 12, 1)
 
 def llm_confirm_forecast_intent(llm: ChatOpenAI, query: str) -> bool:
-    """Cheap yes/no classification using the same mini model."""
     msg = [
         {"role": "system", "content": "You are a classifier. Answer with only 'yes' or 'no'."},
         {"role": "user", "content": f"Does this user request ask for a future forecast or projection? Query: {query}"}
@@ -274,14 +287,12 @@ def detect_forecast_intent(query: str, llm_for_check: ChatOpenAI, latest_date: O
             "require new capacity data not included in this database. Only past trends can be shown."
         ), None
 
-    # Hybrid: fast keyword prefilter then LLM confirm (cheap)
     if not _keyword_maybe_forecast(query):
         return False, None, None, None
 
     if not llm_confirm_forecast_intent(llm_for_check, query):
         return False, None, None, None
 
-    # Identify target series hint
     if any(w in q for w in ["cpi", "inflation", "price index"]):
         hint = "cpi"
     elif any(w in q for w in ["price", "tariff", "balancing", "gcap", "dereg"]):
@@ -307,13 +318,41 @@ def make_timeseries_chart_payload(df: pd.DataFrame, date_col: str, value_col: st
     }
     return data, metadata, "line"
 
-# --- API Endpoint ---
+# --- Health & Diagnostics ---
 @app.get("/healthz")
 def health():
     return {"status": "ok"}
 
+@app.get("/db_ping")
+def db_ping():
+    """Quick DB connectivity check without invoking LLMs."""
+    try:
+        with engine.connect() as c:
+            now = c.execute(text("select now()")).scalar()
+            ver = c.execute(text("select version()")).scalar()
+            return {"ok": True, "now": str(now), "version": str(ver)}
+    except Exception as e:
+        logger.error("DB ping failed: %s", e, exc_info=True)
+        return {"ok": False, "error": str(e)}
+
+@app.get("/diag")
+def diag():
+    """Sanitized view of DB target (no secrets)."""
+    try:
+        url = make_url(SUPABASE_DB_URL)
+        redacted = url.set(password="***")
+        return {
+            "ok": True,
+            "engine_url": str(redacted),
+            "sslmode": "require" if "sslmode=require" in SUPABASE_DB_URL else "unknown",
+            "connect_timeout": "8" if "connect_timeout=8" in SUPABASE_DB_URL else "unknown",
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+
+# --- Main API Endpoint ---
 @app.post("/ask", response_model=APIResponse)
-def ask(q: Question, x_app_key: str = Header(...)):
+def ask(q: Question, x_app_key: str = Header(...), x_debug: Optional[str] = Header(None)):
     start_time = time.time()
     if x_app_key != APP_SECRET_KEY:
         raise HTTPException(status_code=401, detail="Unauthorized")
@@ -337,7 +376,6 @@ def ask(q: Question, x_app_key: str = Header(...)):
         # Prevalidate tables to avoid obvious mistakes
         ok_tables, bad_tables = prevalidate_tables(safe_sql)
         if not ok_tables:
-            # Retry with explicit correction instruction
             hint = f"Use ONLY these tables: {ALLOWED_TABLES}. You used: {bad_tables}. Regenerate."
             gen2 = llm_sql.invoke([
                 {"role": "system", "content": SQL_GENERATOR_PROMPT + "\n" + hint},
@@ -363,7 +401,7 @@ def ask(q: Question, x_app_key: str = Header(...)):
 
         df = coerce_dataframe(rows, columns)
 
-        # Latest date (for relative target extraction)
+        # Latest date (for relative forecast targets)
         latest_date = None
         if "date" in df.columns:
             try:
@@ -408,9 +446,7 @@ def ask(q: Question, x_app_key: str = Header(...)):
                         value_col = df.columns[lower_cols.index(cand)]
                         break
 
-            # Fallback if not found
             if value_col is None:
-                # pick first numeric column that looks like a metric
                 for c in df.select_dtypes(include=["number"]).columns:
                     value_col = c
                     break
@@ -419,7 +455,6 @@ def ask(q: Question, x_app_key: str = Header(...)):
                 fc = forecast_linear_ols(df, date_col="date", value_col=value_col, target_date=target_dt)
                 if fc:
                     computed["forecast"] = {value_col: fc}
-                    # also prepare a simple chart payload
                     try:
                         chart_payload, chart_meta, chart_type = make_timeseries_chart_payload(df, "date", value_col, title="Historical & Trend")
                     except Exception:
@@ -431,7 +466,6 @@ def ask(q: Question, x_app_key: str = Header(...)):
             {"role": "user", "content": f"Question: {q.query}\n\nComputed Stats: {computed}"}
         ])
         final_answer = getattr(narrative, "content", "") or "Here is the analysis."
-
         final_answer = scrub_schema_mentions(final_answer)
 
         return APIResponse(
@@ -443,10 +477,15 @@ def ask(q: Question, x_app_key: str = Header(...)):
         )
 
     except Exception as e:
-        # Attempt one auto-correct cycle on common SQL errors
         msg = str(e)
         logger.error(f"FATAL error in /ask: {msg}", exc_info=True)
-        if "column" in msg.lower() or "relation" in msg.lower() or "does not exist" in msg.lower():
-            safe_user_msg = "I had trouble matching the requested data fields. Please rephrase your question or specify the metric and time frame."
-            raise HTTPException(status_code=400, detail=safe_user_msg)
+
+        # Optional debug exposure (be careful; toggle off in production)
+        debug_header = (x_debug or "").lower() in ("1", "true", "yes") if x_debug is not None else False
+        if DEBUG_ERRORS or debug_header:
+            raise HTTPException(status_code=500, detail=msg)
+
+        if any(tok in msg.lower() for tok in ["does not exist", "column", "relation"]):
+            raise HTTPException(status_code=400, detail="I had trouble matching the requested data fields. Please rephrase your question or specify the metric and time frame.")
+
         raise HTTPException(status_code=500, detail="An internal processing error occurred.")
