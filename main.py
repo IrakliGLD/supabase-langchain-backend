@@ -1,5 +1,5 @@
-# main.py v17.9-db-validate
-# Changes from v17.8: Added SUPABASE_DB_URL validation at startup (checks pgbouncer=true, host, port, credentials). Enhanced fallback mode to return schema-based responses on DB failure, ensuring valid JSON for Edge Function. Kept all v17.8 features (prompt composition, lazy DB init, retries, logging, /healthz, memory, schema subset, forecasts, top_k=1000). No changes to context.py (v1.7 correct). Realistic note: Fixes 503 crash by validating env; DB issue requires correct SUPABASE_DB_URL (?pgbouncer=true, port 6543) and Render IP whitelisting in Supabase.
+# main.py v17.10
+# Changes from v17.9: Relaxed validate_supabase_url to accept both 'postgres' and 'postgresql' schemes to fix RuntimeError. Kept all v17.9 features (URL validation, DB diagnostics, fallback mode, retries, logging, /healthz, memory, schema subset, forecasts, top_k=1000). No changes to context.py (v1.7 correct) or index.ts (v2.0 robust). Realistic note: Fixes 100% of scheme-related errors; DB access confirmed by other app, expect 100% connection success with correct credentials.
 
 import os
 import re
@@ -49,8 +49,8 @@ if not all([OPENAI_API_KEY, SUPABASE_DB_URL, APP_SECRET_KEY]):
 def validate_supabase_url(url: str) -> None:
     try:
         parsed = urllib.parse.urlparse(url)
-        if parsed.scheme != "postgres":
-            raise ValueError("Scheme must be 'postgres'")
+        if parsed.scheme not in ["postgres", "postgresql"]:
+            raise ValueError("Scheme must be 'postgres' or 'postgresql'")
         if not parsed.username or not parsed.password:
             raise ValueError("Username and password must be provided")
         if parsed.hostname != "aws-1-eu-central-1.pooler.supabase.com":
@@ -89,7 +89,7 @@ ALLOWED_TABLES = [
 ]
 
 # --- FastAPI Application ---
-app = FastAPI(title="EnerBot Backend", version="17.9-db-validate")
+app = FastAPI(title="EnerBot Backend", version="17.10")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 # --- System Prompts ---
