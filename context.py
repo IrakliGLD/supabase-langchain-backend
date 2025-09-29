@@ -1,6 +1,7 @@
-# === context.py v1.6 ===
-# Changes from v1.5: Hybrid scrub (regex + LLM fallback if terms leak), split schema into structured dict + prose doc. No other changes—kept labels, values, etc. Realistic note: LLM fallback adds 0.5-1s latency/0.01 USD cost per call, but triggers rarely (5-10% cases); dict enables faster validation but needs sync with prose.
+# === context.py v1.7 ===
+# Changes from v1.6: Added `import os` to fix NameError for os.getenv. No other changes—kept hybrid scrub, schema dict, prose doc, labels, etc. Realistic note: Fix resolves deployment error; no impact on latency/cost since os is standard library.
 
+import os  # Added to fix NameError
 import re
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate
@@ -114,7 +115,12 @@ DB_SCHEMA_DICT = {
     "tables": {
         "dates": {"columns": ["date"], "desc": "Calendar (Months)"},
         "energy_balance_long": {"columns": ["year", "sector", "energy_source", "volume_tj"], "desc": "Energy Balance (by Sector)"},
-        # Add all tables similarly
+        "entities": {"columns": ["entity", "entity_normalized", "type", "ownership", "source"], "desc": "Power Sector Entities"},
+        "monthly_cpi": {"columns": ["date", "cpi_type", "cpi"], "desc": "Consumer Price Index (CPI)"},
+        "price": {"columns": ["date", "p_dereg_gel", "p_bal_gel", "p_gcap_gel", "xrate", "p_dereg_usd", "p_bal_usd", "p_gcap_usd"], "desc": "Electricity Market Prices"},
+        "tariff_gen": {"columns": ["date", "entity", "tariff_gel", "tariff_usd"], "desc": "Regulated Tariffs"},
+        "tech_quantity": {"columns": ["date", "type_tech", "quantity_tech"], "desc": "Generation & Demand Quantities"},
+        "trade": {"columns": ["date", "entity", "segment", "quantity"], "desc": "Electricity Trade"},
     },
     "rules": {
         "unit_conversion": "1 TJ = 277.778 MWh; tech_quantity/trade in thousand MWh (multiply by 1000 for MWh).",
@@ -139,7 +145,36 @@ DB_SCHEMA_DOC = """
 
 ---
 ### Table: public.dates ###
-...
+- Columns: date
+- Description: Calendar data with monthly timestamps.
+
+### Table: public.energy_balance_long ###
+- Columns: year, sector, energy_source, volume_tj
+- Description: Annual energy consumption by sector and source, in terajoules (TJ).
+
+### Table: public.entities ###
+- Columns: entity, entity_normalized, type, ownership, source
+- Description: Details on power sector entities (e.g., power plants, importers).
+
+### Table: public.monthly_cpi ###
+- Columns: date, cpi_type, cpi
+- Description: Monthly Consumer Price Index (CPI) data, base year 2015=100.
+
+### Table: public.price ###
+- Columns: date, p_dereg_gel, p_bal_gel, p_gcap_gel, xrate, p_dereg_usd, p_bal_usd, p_gcap_usd
+- Description: Monthly electricity market prices in GEL and USD per MWh.
+
+### Table: public.tariff_gen ###
+- Columns: date, entity, tariff_gel, tariff_usd
+- Description: Monthly regulated tariffs for entities, in GEL and USD per MWh.
+
+### Table: public.tech_quantity ###
+- Columns: date, type_tech, quantity_tech
+- Description: Monthly generation and demand quantities by technology type, in thousand MWh.
+
+### Table: public.trade ###
+- Columns: date, entity, segment, quantity
+- Description: Monthly electricity trade volumes by market segment, in thousand MWh.
 """
 
 # --- DB_JOINS v1.4 ---
@@ -189,7 +224,7 @@ def scrub_schema_mentions(text: str) -> str:
     # 5) Strip markdown fences
     text = text.replace("```", "").strip()
 
-    # New: LLM fallback if terms still present
+    # 6) LLM fallback if terms still present
     if any(re.search(rf"\b{re.escape(term)}\b", text, re.IGNORECASE) for term in schema_terms):
         llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, openai_api_key=OPENAI_API_KEY)
         fallback_prompt = ChatPromptTemplate.from_messages([
