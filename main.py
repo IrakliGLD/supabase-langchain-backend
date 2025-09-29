@@ -1,11 +1,8 @@
-# === main.py v18.1-diagnostics ===
-# Changes vs v18.0-hybrid:
-# - Enforce sslmode=require and add connect_timeout to the DB URL
-# - Smaller, safer pool config (pgbouncer-friendly)
-# - Added /db_ping endpoint to test DB connectivity
-# - Added /diag endpoint (sanitized) to verify effective DB URL/sslmode
-# - Optional debug error reveal via DEBUG_ERRORS env or X-Debug header
-# - No behavioral changes to the hybrid analysis flow
+# === main.py v18.2-fallback ===
+# Changes vs v18.1-diagnostics:
+# - Auto-fallback from transaction pooler (6543) -> session pooler (5432) when "connection refused"
+# - Centralized engine builder + ensure_engine_ready() used by /db_ping and /ask
+# - Keeps SSL, connect_timeout, diagnostics, and hybrid analysis
 
 import os
 import re
@@ -19,7 +16,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, validator
 from sqlalchemy import create_engine, text
 from sqlalchemy.pool import QueuePool
-from sqlalchemy.engine.url import make_url
+from sqlalchemy.engine.url import make_url, URL
 
 from langchain_openai import ChatOpenAI
 
@@ -61,18 +58,69 @@ def _normalize_db_url(u: str) -> str:
 
 SUPABASE_DB_URL = _normalize_db_url(SUPABASE_DB_URL_RAW)
 
-# --- SQLAlchemy Engine ---
-engine = create_engine(
-    SUPABASE_DB_URL,
-    poolclass=QueuePool,
-    pool_size=5,
-    max_overflow=2,
-    pool_pre_ping=True,
-    pool_recycle=1800,  # recycle stale conns; pgbouncer-friendly
-)
+# --- Engine builder & fallback ---
+def _build_engine(url: str):
+    return create_engine(
+        url,
+        poolclass=QueuePool,
+        pool_size=5,
+        max_overflow=2,
+        pool_pre_ping=True,
+        pool_recycle=1800,  # recycle stale conns; pgbouncer-friendly
+    )
+
+engine = _build_engine(SUPABASE_DB_URL)
+
+def _is_tx_pooler_url(u: URL) -> bool:
+    host = (u.host or "").lower()
+    return "pooler.supabase.com" in host and (u.port == 6543)
+
+def _to_session_pooler(u: URL) -> URL:
+    # same host but switch to session pooler port=5432
+    return u.set(port=5432)
+
+def ensure_engine_ready() -> None:
+    """
+    Try a quick SELECT 1. If connection is refused on transaction pooler (6543),
+    rebuild engine pointing to session pooler (5432) and test again.
+    """
+    global engine, SUPABASE_DB_URL
+    try:
+        with engine.connect() as c:
+            c.execute(text("select 1"))
+            return
+    except Exception as e:
+        msg = str(e)
+        logger.warning("Initial DB ping failed: %s", msg)
+
+        # Only attempt fallback when it's the transaction pooler refusing
+        try:
+            url = make_url(SUPABASE_DB_URL)
+        except Exception:
+            url = None
+
+        refused = ("connection refused" in msg.lower()) or ("refused" in msg.lower())
+        is_tx_pooler = (url is not None and _is_tx_pooler_url(url))
+
+        if refused and is_tx_pooler:
+            logger.warning("Transaction pooler (6543) refused; falling back to Session Pooler (5432).")
+            try:
+                new_url = _to_session_pooler(url)
+                SUPABASE_DB_URL = str(new_url)
+                engine.dispose(close=False)
+                engine = _build_engine(SUPABASE_DB_URL)
+                with engine.connect() as c2:
+                    c2.execute(text("select 1"))
+                logger.info("Fallback to Session Pooler succeeded.")
+                return
+            except Exception as e2:
+                logger.error("Fallback to Session Pooler failed: %s", e2, exc_info=True)
+                raise
+        # If not a pooler refusal case, re-raise original
+        raise
 
 # --- FastAPI Application ---
-app = FastAPI(title="EnerBot Backend", version="18.1-diagnostics")
+app = FastAPI(title="EnerBot Backend", version="18.2-fallback")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 # --- System Prompts ---
@@ -279,7 +327,6 @@ def detect_forecast_intent(query: str, llm_for_check: ChatOpenAI, latest_date: O
     """
     q = query.lower()
 
-    # Blocked categories: generation, imports, exports
     blocked_terms = ["generation", "hydro", "thermal", "wind", "solar", "import", "export"]
     if any(term in q for term in blocked_terms):
         return False, None, (
@@ -325,8 +372,9 @@ def health():
 
 @app.get("/db_ping")
 def db_ping():
-    """Quick DB connectivity check without invoking LLMs."""
+    """Quick DB connectivity check without invoking LLMs (with auto-fallback)."""
     try:
+        ensure_engine_ready()
         with engine.connect() as c:
             now = c.execute(text("select now()")).scalar()
             ver = c.execute(text("select version()")).scalar()
@@ -357,6 +405,9 @@ def ask(q: Question, x_app_key: str = Header(...), x_debug: Optional[str] = Head
     if x_app_key != APP_SECRET_KEY:
         raise HTTPException(status_code=401, detail="Unauthorized")
     try:
+        # Ensure DB engine is working (and fallback if needed) before doing any LLM work
+        ensure_engine_ready()
+
         llm_sql = ChatOpenAI(model="gpt-4o-mini", temperature=0, openai_api_key=OPENAI_API_KEY)
         llm_analysis = ChatOpenAI(model="gpt-4o", temperature=0, openai_api_key=OPENAI_API_KEY)
 
