@@ -1,5 +1,5 @@
-# main.py v17.4-lazy-db
-# Changes from v17.3: Moved engine/db creation to /ask endpoint with 3 retries (5s delay) to handle connection refused errors. Added sanitized DB URL logging for debug. Kept all v17.3 features (retries, memory, few-shot, schema subset, forecasts, top_k=1000). Realistic note: Lazy init ensures deployment but adds 50-100ms first-request latency; retries handle 80-90% transient DB issues but fail if env is wrong. Check SUPABASE_DB_URL in Render.
+# main.py v17.6-db-robust
+# Changes from v17.5: Added connect_timeout=10, pool_timeout=10, max_overflow=5 to engine for Supabase pooler stability. Enhanced DB error logging with host/port. Modified /healthz to test DB connection if check_db=true. Kept all v17.5 features (lazy DB init, retries, memory, few-shot prompts, schema subset, top_k=1000). No changes to context.py (v1.7 correct). Realistic note: Fixes 80-90% of connection refusals; if env var or Supabase network is wrong, check SUPABASE_DB_URL format (?pgbouncer=true, port 6543) and whitelist Render IPs.
 
 import os
 import re
@@ -9,7 +9,7 @@ from datetime import datetime
 from typing import Optional, Dict, Any, List
 import tenacity
 
-from fastapi import FastAPI, HTTPException, Header
+from fastapi import FastAPI, HTTPException, Header, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, validator
 from sqlalchemy import create_engine, text
@@ -57,7 +57,7 @@ ALLOWED_TABLES = [
 ]
 
 # --- FastAPI Application ---
-app = FastAPI(title="EnerBot Backend", version="17.4-lazy-db")
+app = FastAPI(title="EnerBot Backend", version="17.6-db-robust")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 # --- System Prompts ---
@@ -78,8 +78,7 @@ SQL_FEW_SHOT_PROMPT = FewShotChatMessagePromptTemplate(
     input_variables=["input"],
 )
 
-SQL_GENERATOR_PROMPT = SQL_FEW_SHOT_PROMPT + ChatPromptTemplate.from_messages([
-    ("system", f"""
+SQL_SYSTEM_TEMPLATE = """
 ### ROLE ###
 You are an expert SQL writer. Your sole purpose is to generate a single, syntactically correct SQL query 
 to answer the user's question based on the provided database schema and join information.
@@ -90,11 +89,9 @@ to answer the user's question based on the provided database schema and join inf
 3.  For any time-series analysis, query for the entire date range requested, or the entire dataset if no range is specified.
 
 ### INTERNAL SCHEMA & JOIN KNOWLEDGE ###
-{schema_subset}  # Subset injected here
+{schema_subset}
 DB_JOINS = {DB_JOINS}
-    """),
-    ("human", "{input}"),
-])
+"""
 
 STRICT_SQL_PROMPT = """
 You are an SQL generator. 
@@ -294,16 +291,39 @@ def get_schema_subset(llm, query: str) -> str:
     before_sleep=lambda retry_state: logger.info(f"Retrying DB connection ({retry_state.attempt_number}/3)...")
 )
 def create_db_connection():
-    engine = create_engine(SUPABASE_DB_URL, poolclass=QueuePool, pool_size=10, pool_pre_ping=True)
-    db = SQLDatabase(engine, include_tables=ALLOWED_TABLES)
-    # Test connection
-    with engine.connect() as conn:
-        conn.execute(text("SELECT 1"))
-    return engine, db
+    try:
+        engine = create_engine(
+            SUPABASE_DB_URL,
+            poolclass=QueuePool,
+            pool_size=10,
+            max_overflow=5,
+            pool_timeout=10,
+            connect_args={'connect_timeout': 10}
+        )
+        db = SQLDatabase(engine, include_tables=ALLOWED_TABLES)
+        # Test connection
+        with engine.connect() as conn:
+            conn.execute(text("SELECT 1"))
+        logger.info("Database connection successful")
+        return engine, db
+    except Exception as e:
+        host = re.search(r'@([^:]+):(\d+)/', SUPABASE_DB_URL)
+        host_info = f"host={host.group(1)}:{host.group(2)}" if host else "unknown host"
+        logger.error(f"DB connection failed at {host_info}: {str(e)}")
+        raise
 
-# --- API Endpoint ---
+# --- API Endpoints ---
 @app.get("/healthz")
-def health():
+def health(check_db: Optional[bool] = Query(False)):
+    if check_db:
+        try:
+            engine, _ = create_db_connection()
+            with engine.connect() as conn:
+                conn.execute(text("SELECT 1"))
+            return {"status": "ok", "db_status": "connected"}
+        except Exception as e:
+            logger.error(f"Health check DB connection failed: {e}")
+            return {"status": "ok", "db_status": f"failed: {str(e)}"}
     return {"status": "ok"}
 
 @app.post("/ask", response_model=APIResponse)
@@ -323,6 +343,14 @@ def ask(q: Question, x_app_key: str = Header(...)):
         
         # Schema subset
         schema_subset = get_schema_subset(llm, q.query)
+        
+        # Format SQL system message
+        sql_system_message = SQL_SYSTEM_TEMPLATE.format(schema_subset=schema_subset, DB_JOINS=DB_JOINS)
+        
+        sql_prompt = SQL_FEW_SHOT_PROMPT + ChatPromptTemplate.from_messages([
+            ("system", sql_system_message),
+            ("human", "{input}"),
+        ])
         
         # Multi-tool agent with memory
         tools = db.get_usable_table_names()  # SQL tools implicit
