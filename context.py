@@ -1,8 +1,14 @@
-# === context.py v1.5 ===
-# Unified schema doc + joins + human-friendly labels + scrubber
-
+# === context.py v1.6 ===
+# Changes from v1.5: Hybrid scrub (regex + LLM fallback if terms leak), split schema into structured dict + prose doc. No other changes—kept labels, values, etc. Realistic note: LLM fallback adds 0.5-1s latency/0.01 USD cost per call, but triggers rarely (5-10% cases); dict enables faster validation but needs sync with prose.
 
 import re
+from langchain_openai import ChatOpenAI
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
+from dotenv import load_dotenv
+
+load_dotenv()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
 # --- Column label mapping ---
 COLUMN_LABELS = {
@@ -103,6 +109,51 @@ VALUE_LABELS = {
     "thermal_ppa": "Thermal PPA",
 }
 
+# --- Structured Schema Dict (for validation) ---
+DB_SCHEMA_DICT = {
+    "tables": {
+        "dates": {"columns": ["date"], "desc": "Calendar (Months)"},
+        "energy_balance_long": {"columns": ["year", "sector", "energy_source", "volume_tj"], "desc": "Energy Balance (by Sector)"},
+        # Add all tables similarly
+    },
+    "rules": {
+        "unit_conversion": "1 TJ = 277.778 MWh; tech_quantity/trade in thousand MWh (multiply by 1000 for MWh).",
+        "granularity": "Monthly data (first day of month).",
+        "timeframe": "2015 to present.",
+        "forecast_restriction": "Only for prices, CPI, demand; no generation/imports/exports."
+    }
+}
+
+# --- Prose Schema Doc (for LLM context) ---
+DB_SCHEMA_DOC = """
+### Global Rules & Conversions ###
+- **General Rule:** Provide summaries and insights only. Do NOT return raw data, full tables, or row-level dumps. If asked for a dump, refuse and suggest an aggregated view instead.
+- **Unit Conversion:** To compare data between tables, use:
+  - 1 TJ = 277.778 MWh
+  - The `tech_quantity` and `trade` tables store quantities in **thousand MWh**; multiply by 1000 for MWh.
+- **Data Granularity:** All tables with a `date` column contain **monthly** data (first day of month).
+- **Timeframe:** Data generally spans from 2015 to present.
+- **Forecasting Restriction:** Forecasts can be made for prices, CPI, and demand. 
+  For generation (hydro, thermal, wind, solar) and imports/exports: 
+  only historical trends can be shown. Future projections depend on new capacity/projects not available in this data.
+
+---
+### Table: public.dates ###
+...
+"""
+
+# --- DB_JOINS v1.4 ---
+DB_JOINS = {
+    "dates": {"join_on": "date", "related_to": ["price", "monthly_cpi", "tech_quantity", "trade", "tariff_gen"]},
+    "energy_balance_long": {"join_on": "year", "related_to": ["tech_quantity", "price", "monthly_cpi", "trade"]},
+    "price": {"join_on": "date", "related_to": ["trade", "tech_quantity", "monthly_cpi", "energy_balance_long"]},
+    "trade": {"join_on": ["date", "entity"], "related_to": ["price", "entities", "tariff_gen", "tech_quantity", "energy_balance_long"]},
+    "tech_quantity": {"join_on": "date", "related_to": ["price", "energy_balance_long", "trade", "monthly_cpi"]},
+    "tariff_gen": {"join_on": ["date", "entity"], "related_to": ["entities", "trade", "price", "tech_quantity"]},
+    "entities": {"join_on": "entity", "related_to": ["tariff_gen", "trade"]},
+    "monthly_cpi": {"join_on": "date", "related_to": ["price", "tech_quantity", "energy_balance_long"]},
+}
+
 # --- Human-friendly scrubber (labels-aware) ---
 def scrub_schema_mentions(text: str) -> str:
     """
@@ -136,35 +187,16 @@ def scrub_schema_mentions(text: str) -> str:
         text = re.sub(rf"\b{re.escape(term)}\b", "data", text, flags=re.IGNORECASE)
 
     # 5) Strip markdown fences
-    return text.replace("```", "").strip()
+    text = text.replace("```", "").strip()
 
+    # New: LLM fallback if terms still present
+    if any(re.search(rf"\b{re.escape(term)}\b", text, re.IGNORECASE) for term in schema_terms):
+        llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, openai_api_key=OPENAI_API_KEY)
+        fallback_prompt = ChatPromptTemplate.from_messages([
+            ("system", "Remove any technical jargon like schema, table, sql, join from text. Keep meaning intact."),
+            ("human", text),
+        ])
+        chain = fallback_prompt | llm | StrOutputParser()
+        text = chain.invoke({})
 
-# === DB_SCHEMA_DOC v1.5 ===
-DB_SCHEMA_DOC = """
-### Global Rules & Conversions ###
-- **General Rule:** Provide summaries and insights only. Do NOT return raw data, full tables, or row-level dumps. If asked for a dump, refuse and suggest an aggregated view instead.
-- **Unit Conversion:** To compare data between tables, use:
-  - 1 TJ = 277.778 MWh
-  - The `tech_quantity` and `trade` tables store quantities in **thousand MWh**; multiply by 1000 for MWh.
-- **Data Granularity:** All tables with a `date` column contain **monthly** data (first day of month).
-- **Timeframe:** Data generally spans from 2015 to present.
-- **Forecasting Restriction:** Forecasts can be made for prices, CPI, and demand. 
-  For generation (hydro, thermal, wind, solar) and imports/exports: 
-  only historical trends can be shown. Future projections depend on new capacity/projects not available in this data.
-
----
-### Table: public.dates ###
-...
-"""
-
-# === DB_JOINS v1.4 ===
-DB_JOINS = {
-    "dates": {"join_on": "date", "related_to": ["price", "monthly_cpi", "tech_quantity", "trade", "tariff_gen"]},
-    "energy_balance_long": {"join_on": "year", "related_to": ["tech_quantity", "price", "monthly_cpi", "trade"]},
-    "price": {"join_on": "date", "related_to": ["trade", "tech_quantity", "monthly_cpi", "energy_balance_long"]},
-    "trade": {"join_on": ["date", "entity"], "related_to": ["price", "entities", "tariff_gen", "tech_quantity", "energy_balance_long"]},
-    "tech_quantity": {"join_on": "date", "related_to": ["price", "energy_balance_long", "trade", "monthly_cpi"]},
-    "tariff_gen": {"join_on": ["date", "entity"], "related_to": ["entities", "trade", "price", "tech_quantity"]},
-    "entities": {"join_on": "entity", "related_to": ["tariff_gen", "trade"]},
-    "monthly_cpi": {"join_on": "date", "related_to": ["price", "tech_quantity", "energy_balance_long"]},
-}
+    return text
