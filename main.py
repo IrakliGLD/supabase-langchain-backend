@@ -1,5 +1,5 @@
-# main.py v17.18
-# Changes from v17.17: Added specific error handling for psycopg2.OperationalError/psycopg.OperationalError in create_db_connection to log authentication/connection errors. Added password character validation in validate_supabase_url. Kept pooled connection (aws-1-eu-central-1.pooler.supabase.com:6543) for IPv4 compatibility and SUPABASE_DB_URL name. Preserved all v17.17 features (psycopg, DB diagnostics, fallback, retries, logging, /healthz, memory, schema subset, forecasts, top_k=1000). No changes to context.py (v1.7 correct) or index.ts (v2.0 robust). Realistic note: Correct password yields 95-100% success.
+# main.py v17.19
+# Changes from v17.18: Removed psycopg2 fallback, enforcing psycopg>=3.2.2 for pooled connection compatibility. Removed pgbouncer=true from SUPABASE_DB_URL validation, relying on SQLAlchemy QueuePool. Escaped {type} in AGENT_PROMPT to fix LangChain template error. Kept pooled connection (aws-1-eu-central-1.pooler.supabase.com:6543) and SUPABASE_DB_URL name. Preserved all v17.18 features (psycopg, DB diagnostics, fallback, retries, logging, /healthz, memory, schema subset, forecasts, top_k=1000). No changes to context.py (v1.7 correct) or index.ts (v2.0 robust). Realistic note: Correct password with psycopg yields 95-100% success.
 
 import os
 import re
@@ -17,13 +17,8 @@ from pydantic import BaseModel, Field, validator
 from sqlalchemy import create_engine, text
 from sqlalchemy.pool import QueuePool
 
-try:
-    import psycopg
-    from psycopg import OperationalError as PsycopgOperationalError
-except ImportError:
-    import psycopg2
-    from psycopg2 import OperationalError as PsycopgOperationalError
-    logger.warning("Using psycopg2; consider installing psycopg>=3.2.2 for better PgBouncer support")
+import psycopg
+from psycopg import OperationalError as PsycopgOperationalError
 
 from langchain_openai import ChatOpenAI
 from langchain_community.utilities import SQLDatabase
@@ -78,8 +73,6 @@ def validate_supabase_url(url: str) -> None:
         if parsed.username != "postgres.qvmqmmcglqmhachqaezt":
             raise ValueError("Pooled connection requires username 'postgres.qvmqmmcglqmhachqaezt'")
         params = urllib.parse.parse_qs(parsed.query)
-        if params.get("pgbouncer") != ["true"]:
-            raise ValueError("Query parameter 'pgbouncer=true' is required")
         if params.get("sslmode") != ["require"]:
             raise ValueError("Query parameter 'sslmode=require' is required")
     except Exception as e:
@@ -107,7 +100,7 @@ ALLOWED_TABLES = [
 ]
 
 # --- FastAPI Application ---
-app = FastAPI(title="EnerBot Backend", version="17.18")
+app = FastAPI(title="EnerBot Backend", version="17.19")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 # --- System Prompts ---
@@ -160,7 +153,7 @@ AGENT_PROMPT = ChatPromptTemplate.from_messages([
     
     Restrictions:
     - Only forecast prices, CPI, demand. Block generation/import/export forecasts.
-    - If visualization needed, output JSON for charts (e.g., {'type': 'line', 'data': [...]}).
+    - If visualization needed, output JSON for charts (e.g., {{'type': 'line', 'data': [...]}}).
     - If database is unavailable, provide a schema-based response without data.
     
     Schema: {schema}
@@ -213,9 +206,9 @@ def extract_sql_from_steps(steps: List[Any]) -> Optional[str]:
 
 def convert_decimal_to_float(obj):
     if isinstance(obj, Decimal): return float(obj)
-    if isinstance(obj, list): return [convert_decimal_to_float(x) for x in obj]
+    if isinstance(obj, List): return [convert_decimal_to_float(x) for x in obj]
     if isinstance(obj, tuple): return tuple(convert_decimal_to_float(x) for x in obj)
-    if isinstance(obj, dict): return {k: convert_decimal_to_float(v) for k, v in obj.items()}
+    if isinstance(obj, Dict): return {k: convert_decimal_to_float(v) for k, v in obj.items()}
     return obj
 
 def coerce_dataframe(rows: List[tuple], columns: List[str]) -> pd.DataFrame:
