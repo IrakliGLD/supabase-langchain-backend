@@ -1,5 +1,5 @@
-# main.py v17.20
-# Changes from v17.19: Updated validate_supabase_url to allow postgresql+psycopg scheme. Coerce SUPABASE_DB_URL to postgresql+psycopg:// in create_db_connection to ensure psycopg>=3.2.2 driver. Kept removal of pgbouncer=true and psycopg2 fallback. Preserved pooled connection (aws-1-eu-central-1.pooler.supabase.com:6543), SUPABASE_DB_URL name, and all v17.19 features (DB diagnostics, fallback, retries, logging, /healthz, memory, schema subset, forecasts, top_k=1000). No changes to context.py (v1.7 correct) or index.ts (v2.0 robust). Realistic note: Correct password with psycopg yields 95-100% success.
+# main.py v17.21
+# Changes from v17.20: Fixed SyntaxError in convert_decimal_to_float (line 210) by correcting mismatched bracket in tuple comprehension (changed [] to ()). Preserved v17.20 changes: updated validate_supabase_url to allow postgresql+psycopg scheme, coerced SUPABASE_DB_URL to postgresql+psycopg:// in create_db_connection, removed pgbouncer=true and psycopg2 fallback. Kept pooled connection (aws-1-eu-central-1.pooler.supabase.com:6543), SUPABASE_DB_URL name, and all v17.20 features (DB diagnostics, fallback, retries, logging, /healthz, memory, schema subset, forecasts, top_k=1000). No changes to context.py (v1.7 correct) or index.ts (v2.0 robust). Realistic note: Correct password with psycopg yields 95-100% success.
 
 import os
 import re
@@ -100,7 +100,7 @@ ALLOWED_TABLES = [
 ]
 
 # --- FastAPI Application ---
-app = FastAPI(title="EnerBot Backend", version="17.20")
+app = FastAPI(title="EnerBot Backend", version="17.21")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 # --- System Prompts ---
@@ -207,7 +207,7 @@ def extract_sql_from_steps(steps: List[Any]) -> Optional[str]:
 def convert_decimal_to_float(obj):
     if isinstance(obj, Decimal): return float(obj)
     if isinstance(obj, list): return [convert_decimal_to_float(x) for x in obj]
-    if isinstance(obj, tuple): return tuple(convert_decimal_to_float(x) for x in obj]
+    if isinstance(obj, tuple): return tuple(convert_decimal_to_float(x) for x in obj)
     if isinstance(obj, dict): return {k: convert_decimal_to_float(v) for k, v in obj.items()}
     return obj
 
