@@ -1,5 +1,5 @@
-# main.py v17.34
-# Changes from v17.33: Enhanced detect_forecast_intent with fuzzy matching for tariff_gel (e.g., 'tariff', 'enguri', 'hpp') and tech_quantity variables (hydro, wind, thermal, import, export) using regex. Moved detect_forecast_intent to start of /ask for early blocking. Fixed context passing in execute_python_code for forecasts. Updated blocked variable messages for professional tone. Added logging for bypassed queries. Kept gpt-4o-mini (~$0.003/query), forecasting (p_bal_gel/p_bal_usd yearly/summer/winter, tech_quantity total/Abkhazeti/others, energy_balance_long energy_source/sector), blocked variables (p_dereg_gel, p_gcap_gel, tariff_gel, hydro, wind, thermal, import, export), max_iterations=12, RateLimitError retries, freq='ME', connect_timeout=120s, pool_timeout=120s, retries=7, connect_args={'options': '-csearch_path=public', 'keepalives': 1, 'keepalives_idle': 30, 'keepalives_interval': 30, 'keepalives_count': 5}, pool_pre_ping=True, pool_recycle=300, SQLDatabaseToolkit, postgresql+psycopg://, psycopg>=3.2.2, no pgbouncer=true, logging, /healthz, memory, top_k=1000, DB_SCHEMA_DOC/DB_JOINS, openai>=1.0.0. No changes to context.py (v1.7), index.ts (v2.0). Realistic: ~90% success, 5-10% cold start failures.
+# main.py v17.35
+# Changes from v17.34: Fixed context passing in /ask to ensure sql_result is passed to execute_python_code for forecasts. Reinforced p_bal_usd calculation (p_bal_gel / xrate) in SQL_SYSTEM_TEMPLATE, AGENT_PROMPT, and FEW_SHOT_EXAMPLES. Kept gpt-4o-mini (~$0.003/query), forecasting (p_bal_gel/p_bal_usd yearly/summer/winter, tech_quantity total/Abkhazeti/others, energy_balance_long energy_source/sector), blocked variables (p_dereg_gel, p_gcap_gel, tariff_gel, hydro, wind, thermal, import, export), max_iterations=12, RateLimitError retries, freq='ME', connect_timeout=120s, pool_timeout=120s, retries=7, connect_args={'options': '-csearch_path=public', 'keepalives': 1, 'keepalives_idle': 30, 'keepalives_interval': 30, 'keepalives_count': 5}, pool_pre_ping=True, pool_recycle=300, SQLDatabaseToolkit, postgresql+psycopg://, psycopg>=3.2.2, no pgbouncer=true, logging, /healthz, memory, top_k=1000, DB_SCHEMA_DOC/DB_JOINS, openai>=1.0.0. No changes to context.py (v1.7), index.ts (v2.0). Realistic: ~90% success, 5-10% cold start failures.
 
 import os
 import re
@@ -114,7 +114,7 @@ ALLOWED_TABLES = [
 schema_cache = {}
 
 # --- FastAPI Application ---
-app = FastAPI(title="EnerBot Backend", version="17.34")
+app = FastAPI(title="EnerBot Backend", version="17.35")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 # --- System Prompts ---
@@ -122,7 +122,7 @@ FEW_SHOT_EXAMPLES = [
     {"input": "What is the average price in 2020?", "output": "SELECT AVG(p_dereg_gel) FROM price WHERE date >= '2020-01-01' AND date < '2021-01-01';"},
     {"input": "Correlate CPI and prices", "output": "SELECT m.date, m.cpi, p.p_dereg_gel FROM monthly_cpi m JOIN price p ON m.date = p.date WHERE m.cpi_type = 'overall_cpi';"},
     {"input": "What was electricity generation in May 2023?", "output": "SELECT SUM(quantity_tech) * 1000 AS total_generation_mwh FROM tech_quantity WHERE date = '2023-05-01';"},
-    {"input": "What was balancing electricity price in May 2023?", "output": "SELECT p_bal_gel, (p_bal_gel / xrate) AS p_bal_usd FROM price WHERE date = '2023-05-01';"},
+    {"input": "What was balancing electricity price in May 2023?", "output": "SELECT date, p_bal_gel, (p_bal_gel / xrate) AS p_bal_usd FROM price WHERE date = '2023-05-01';"},
     {"input": "Predict balancing electricity price by December 2035?", "output": "SELECT date, p_bal_gel, xrate FROM price ORDER BY date;"},
     {"input": "Predict the electricity demand for 2030?", "output": "SELECT date, entity, quantity_tech FROM tech_quantity WHERE entity IN ('Abkhazeti', 'direct customers', 'losses', 'self-cons', 'supply-distribution') ORDER BY date;"},
     {"input": "Predict tariff for Enguri HPP?", "output": "SELECT 1;"}
@@ -138,7 +138,7 @@ to answer the user's question based on the provided database schema and join inf
 2. Use `DB_JOINS` for table joins.
 3. For time-series analysis, query the entire date range or all data if unspecified.
 4. For forecasts, use exact row count from SQL results (e.g., count rows for data length).
-5. For balancing electricity price (p_bal_gel, p_bal_usd), compute p_bal_usd as p_bal_gel / xrate; p_bal_usd does not exist. Forecast yearly, summer (May-Aug), and winter (Sep-Apr) averages.
+5. For balancing electricity price (p_bal_gel, p_bal_usd), compute p_bal_usd as p_bal_gel / xrate; never select p_bal_usd directly. Forecast yearly, summer (May-Aug), and winter (Sep-Apr) averages.
 6. For demand forecasts (tech_quantity), sum quantity_tech for entities: Abkhazeti, direct customers, losses, self-cons, supply-distribution; exclude export. Forecast total, Abkhazeti, and other entities separately using seasonal models (period=12).
 7. For energy_balance_long, forecast demand by energy_source and sector only using seasonal models.
 8. Do not select non-existent columns (e.g., p_bal_usd). Validate against schema.
@@ -180,6 +180,7 @@ AGENT_PROMPT = ChatPromptTemplate.from_messages([
     - Block forecasts for p_dereg_gel, p_gcap_gel, tariff_gel, and tech_quantity variables (hydro, wind, thermal, import, export) with user-friendly reasons.
     - Use exact SQL result lengths for DataFrame creation in execute_python_code.
     - For demand forecasts, always query tech_quantity; never use simulated data.
+    - For balancing price forecasts, always compute p_bal_usd as p_bal_gel / xrate; never select p_bal_usd directly.
     - For visualization, output JSON (e.g., {{'type': 'line', 'data': [...]}}).
     - If database unavailable, provide schema-based response.
     
@@ -608,12 +609,25 @@ def ask(q: Question, x_app_key: str = Header(...)):
                                 winter_avg_gel = forecast_gel[winter_mask].mean() if winter_mask.any() else None
                                 summer_avg_usd = forecast_usd[summer_mask].mean() if summer_mask.any() else None
                                 winter_avg_usd = forecast_usd[winter_mask].mean() if winter_mask.any() else None
-                                raw_output += (
-                                    f"\nForecast for {target_dt.strftime('%Y-%m')}:\n"
+                                raw_output = (
+                                    f"Forecast for {target_dt.strftime('%Y-%m')}:\n"
                                     f"Yearly average: {yearly_avg_gel:.2f} GEL/MWh, {yearly_avg_usd:.2f} USD/MWh\n"
-                                    f"Summer (May-Aug) average: {summer_avg_gel:.2f} GEL/MWh, {yearly_avg_usd:.2f} USD/MWh\n"
-                                    f"Winter (Sep-Apr) average: {winter_avg_gel:.2f} GEL/MWh, {yearly_avg_usd:.2f} USD/MWh"
+                                    f"Summer (May-Aug) average: {summer_avg_gel:.2f} GEL/MWh, {summer_avg_usd:.2f} USD/MWh\n"
+                                    f"Winter (Sep-Apr) average: {winter_avg_gel:.2f} GEL/MWh, {winter_avg_usd:.2f} USD/MWh"
                                 )
+                                chart_data = {
+                                    "type": "line",
+                                    "data": [
+                                        {"date": str(date), "p_bal_gel": gel, "p_bal_usd": usd}
+                                        for date, gel, usd in zip(
+                                            pd.date_range(start=last_date, periods=steps, freq="ME"),
+                                            forecast_gel,
+                                            forecast_usd
+                                        )
+                                    ]
+                                }
+                                chart_type = "line"
+                                chart_metadata = {"title": f"Balancing Electricity Price Forecast to {target_dt.strftime('%Y-%m')}"}
                             elif "quantity_tech" in df.columns and "entity" in df.columns:
                                 # Demand forecast from tech_quantity
                                 allowed_entities = ["Abkhazeti", "direct customers", "losses", "self-cons", "supply-distribution"]
@@ -633,7 +647,7 @@ def ask(q: Question, x_app_key: str = Header(...)):
                                 forecast_total = fit_total.forecast(steps=steps)
                                 forecast_abkhazeti = fit_abkhazeti.forecast(steps=steps)
                                 forecast_others = fit_others.forecast(steps=steps)
-                                raw_output += (
+                                raw_output = (
                                     f"\nDemand Forecast for {target_dt.strftime('%Y-%m')}:\n"
                                     f"Total demand: {forecast_total[-1]:.2f} MWh\n"
                                     f"Abkhazeti: {forecast_abkhazeti[-1]:.2f} MWh\n"
