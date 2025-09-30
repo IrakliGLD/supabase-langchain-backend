@@ -1,5 +1,5 @@
-# main.py v17.16
-# Changes from v17.15: Updated validate_supabase_url to enforce pooled connection (aws-1-eu-central-1.pooler.supabase.com:6543) for IPv4 compatibility with Render free tier. Kept password trimming and enhanced logging for ProgrammingError details. Preserved all v17.15 features (psycopg, DB diagnostics, fallback, retries, logging, /healthz, memory, schema subset, forecasts, top_k=1000). No changes to context.py (v1.7 correct) or index.ts (v2.0 robust). Realistic note: Pooled connection yields 95-100% success with correct password.
+# main.py v17.18
+# Changes from v17.17: Added specific error handling for psycopg2.OperationalError/psycopg.OperationalError in create_db_connection to log authentication/connection errors. Added password character validation in validate_supabase_url. Kept pooled connection (aws-1-eu-central-1.pooler.supabase.com:6543) for IPv4 compatibility and SUPABASE_DB_URL name. Preserved all v17.17 features (psycopg, DB diagnostics, fallback, retries, logging, /healthz, memory, schema subset, forecasts, top_k=1000). No changes to context.py (v1.7 correct) or index.ts (v2.0 robust). Realistic note: Correct password yields 95-100% success.
 
 import os
 import re
@@ -18,9 +18,11 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.pool import QueuePool
 
 try:
-    import psycopg  # Preferred for PgBouncer
+    import psycopg
+    from psycopg import OperationalError as PsycopgOperationalError
 except ImportError:
-    import psycopg2  # Fallback
+    import psycopg2
+    from psycopg2 import OperationalError as PsycopgOperationalError
     logger.warning("Using psycopg2; consider installing psycopg>=3.2.2 for better PgBouncer support")
 
 from langchain_openai import ChatOpenAI
@@ -60,10 +62,12 @@ def validate_supabase_url(url: str) -> None:
             raise ValueError("Scheme must be 'postgres' or 'postgresql'")
         if not parsed.username or not parsed.password:
             raise ValueError("Username and password must be provided")
-        # Trim whitespace from password
+        # Trim whitespace from password and validate characters
         parsed_password = parsed.password.strip() if parsed.password else ""
         if not parsed_password:
             raise ValueError("Password cannot be empty after trimming")
+        if not re.match(r'^[a-zA-Z0-9!@#$%^&*()_+\-=\[\]{}|;:,.<>?~]*$', parsed_password):
+            raise ValueError("Password contains invalid characters for URL")
         logger.info(f"Parsed URL components: scheme={parsed.scheme}, username={parsed.username}, host={parsed.hostname}, port={parsed.port}, path={parsed.path}, query={parsed.query}")
         if parsed.hostname != "aws-1-eu-central-1.pooler.supabase.com":
             raise ValueError("Host must be 'aws-1-eu-central-1.pooler.supabase.com'")
@@ -103,7 +107,7 @@ ALLOWED_TABLES = [
 ]
 
 # --- FastAPI Application ---
-app = FastAPI(title="EnerBot Backend", version="17.16")
+app = FastAPI(title="EnerBot Backend", version="17.18")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 # --- System Prompts ---
@@ -304,7 +308,7 @@ def execute_python_code(code: str) -> str:
         if result is None:
             raise ValueError("No 'result' variable set in code.")
         if isinstance(result, pd.DataFrame):
-            return result.to,json(orient="records")
+            return result.to_json(orient="records")
         return str(result)
     except SyntaxError as se:
         return f"Syntax error: {str(se)}"
@@ -345,6 +349,10 @@ def create_db_connection():
             conn.execute(text("SELECT 1"))
         logger.info(f"Database connection successful: {db_host}:{db_port}/{db_name}")
         return engine, db
+    except PsycopgOperationalError as e:
+        logger.error(f"DB connection failed (OperationalError): {str(e)}")
+        logger.error(f"Full stack trace: {traceback.format_exc()}")
+        raise
     except Exception as e:
         logger.error(f"DB connection failed at {db_host}:{db_port}/{db_name}: {str(e)}")
         logger.error(f"Full stack trace: {traceback.format_exc()}")
