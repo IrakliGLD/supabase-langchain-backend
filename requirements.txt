@@ -2,10 +2,10 @@ sqlalchemy==2.0.36
 psycopg==3.2.2
 fastapi==0.115.2
 uvicorn==0.32.0
-langchain # Allow latest version
-langchain-openai # Allow latest compatible version
-langchain-community # Allow latest compatible version
-langchain-core # Allow latest compatible version
+langchain==0.3.2
+langchain-openai==0.2.2
+langchain-community==0.3.1
+langchain-core==0.3.9  
 pydantic==2.9.2
 tenacity==8.5.0
 pandas==2.2.3
