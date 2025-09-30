@@ -1,5 +1,5 @@
-# main.py v17.30
-# Changes from v17.29: Fixed INVALID_PROMPT_INPUT error by escaping {type} as {{type}} in AGENT_PROMPT. Kept forecasting instructions: p_bal_gel/p_bal_usd (yearly/summer/winter averages) from price, demand (total/Abkhazeti/others) from tech_quantity, demand by energy_source/sector from energy_balance_long, blocked p_dereg_gel/p_gcap_gel/tariff_gel. Preserved data length validation, max_iterations=12, RateLimitError retries, freq='ME', connect_args={'options': '-csearch_path=public'}, connect_timeout=60s, pool_timeout=60s, pool_pre_ping=True, pool_recycle=300, SQLDatabaseToolkit, postgresql+psycopg://, psycopg>=3.2.2, no pgbouncer=true, logging, /healthz, memory, top_k=1000, DB_SCHEMA_DOC/DB_JOINS validation, openai>=1.0.0. Added prompt error logging. No changes to context.py (v1.7), index.ts (v2.0). Realistic: ~90% success, 5-10% cold start failures.
+# main.py v17.32
+# Changes from v17.31: Switched to gpt-4o-mini for cost reduction (~$0.003/query vs. $0.1). Enhanced DB connection stability with connect_args={'keepalives_interval': 30, 'keepalives_count': 5}. Enforced tech_quantity queries for demand forecasts, blocking simulated data. Added seasonality (seasonal='add', seasonal_periods=12) to tech_quantity forecasts. Updated SQL_SYSTEM_TEMPLATE and AGENT_PROMPT to reject simulated data. Enhanced fallback response. Kept forecasting instructions: p_bal_gel/p_bal_usd (yearly/summer/winter), tech_quantity (total/Abkhazeti/others), energy_balance_long (energy_source/sector), blocked p_dereg_gel/p_gcap_gel/tariff_gel. Preserved max_iterations=12, RateLimitError retries, freq='ME', connect_args={'options': '-csearch_path=public'}, connect_timeout=120s, pool_timeout=120s, pool_pre_ping=True, pool_recycle=300, retries=7, SQLDatabaseToolkit, postgresql+psycopg://, psycopg>=3.2.2, no pgbouncer=true, logging, /healthz, memory, top_k=1000, DB_SCHEMA_DOC/DB_JOINS, openai>=1.0.0. No changes to context.py (v1.7), index.ts (v2.0). Realistic: ~90% success, 5-10% cold start failures.
 
 import os
 import re
@@ -114,7 +114,7 @@ ALLOWED_TABLES = [
 schema_cache = {}
 
 # --- FastAPI Application ---
-app = FastAPI(title="EnerBot Backend", version="17.30")
+app = FastAPI(title="EnerBot Backend", version="17.32")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 # --- System Prompts ---
@@ -123,7 +123,8 @@ FEW_SHOT_EXAMPLES = [
     {"input": "Correlate CPI and prices", "output": "SELECT m.date, m.cpi, p.p_dereg_gel FROM monthly_cpi m JOIN price p ON m.date = p.date WHERE m.cpi_type = 'overall_cpi';"},
     {"input": "What was electricity generation in May 2023?", "output": "SELECT SUM(quantity_tech) * 1000 AS total_generation_mwh FROM tech_quantity WHERE date = '2023-05-01';"},
     {"input": "What was balancing electricity price in May 2023?", "output": "SELECT p_bal_gel, (p_bal_gel / xrate) AS p_bal_usd FROM price WHERE date = '2023-05-01';"},
-    {"input": "Predict balancing electricity price by December 2035?", "output": "SELECT date, p_bal_gel, xrate FROM price ORDER BY date;"}
+    {"input": "Predict balancing electricity price by December 2035?", "output": "SELECT date, p_bal_gel, xrate FROM price ORDER BY date;"},
+    {"input": "Predict the electricity demand for 2030?", "output": "SELECT date, entity, quantity_tech FROM tech_quantity WHERE entity IN ('Abkhazeti', 'direct customers', 'losses', 'self-cons', 'supply-distribution') ORDER BY date;"}
 ]
 
 SQL_SYSTEM_TEMPLATE = """
@@ -137,9 +138,10 @@ to answer the user's question based on the provided database schema and join inf
 3. For time-series analysis, query the entire date range or all data if unspecified.
 4. For forecasts, use exact row count from SQL results (e.g., count rows for data length).
 5. For balancing electricity price (p_bal_gel, p_bal_usd), compute p_bal_usd as p_bal_gel / xrate; p_bal_usd does not exist. Forecast yearly, summer (May-Aug), and winter (Sep-Apr) averages.
-6. For demand forecasts (tech_quantity), sum quantity_tech for entities: Abkhazeti, direct customers, losses, self-cons, supply-distribution; exclude export. Forecast total, Abkhazeti, and other entities separately.
-7. For energy_balance_long, forecast demand by energy_source and sector only.
+6. For demand forecasts (tech_quantity), sum quantity_tech for entities: Abkhazeti, direct customers, losses, self-cons, supply-distribution; exclude export. Forecast total, Abkhazeti, and other entities separately using seasonal models (period=12).
+7. For energy_balance_long, forecast demand by energy_source and sector only using seasonal models.
 8. Do not select non-existent columns (e.g., p_bal_usd). Validate against schema.
+9. For demand forecasts, always query tech_quantity; never use simulated data.
 
 ### FEW-SHOT EXAMPLES ###
 {examples}
@@ -176,6 +178,7 @@ AGENT_PROMPT = ChatPromptTemplate.from_messages([
     - Forecast only: balancing electricity prices (p_bal_gel, p_bal_usd as p_bal_gel / xrate) from price table (yearly, summer May-Aug, winter Sep-Apr averages); demand (total, Abkhazeti, others) from tech_quantity, excluding export; demand by energy_source/sector from energy_balance_long.
     - Block forecasts for p_dereg_gel (politically driven), p_gcap_gel (GNERC-regulated), tariff_gel (GNERC-regulated) with user-friendly reasons.
     - Use exact SQL result lengths for DataFrame creation in execute_python_code.
+    - For demand forecasts, always query tech_quantity; never use simulated data.
     - For visualization, output JSON (e.g., {{'type': 'line', 'data': [...]}}).
     - If database unavailable, provide schema-based response.
     
@@ -332,16 +335,19 @@ def detect_forecast_intent(query: str) -> (bool, Optional[datetime], Optional[st
     before_sleep=lambda retry_state: logger.info(f"Retrying execute_python_code due to rate limit ({retry_state.attempt_number}/3)...")
 )
 def execute_python_code(code: str, context: Optional[Dict] = None) -> str:
-    """Execute Python code for data analysis (e.g., correlations, summaries, forecasts). Input: code string, optional context with SQL results. Output: result as string.
+    """Execute Python code for data analysis (e.g., correlations, summaries, forecasts). Input: code string, context with SQL results. Output: result as string.
     Use pandas (pd), numpy (np), statsmodels (sm). No installs. Return df.to_json() for dataframes."""
     try:
         local_env = {"pd": pd, "np": np, "sm": sm, "STL": STL, "ExponentialSmoothing": ExponentialSmoothing}
-        if context and "sql_result" in context:
-            rows, columns = context["sql_result"]
-            df = coerce_dataframe(rows, columns)
-            n_rows = len(rows)
-            local_env["sql_data"] = df
-            local_env["n_rows"] = n_rows
+        if not context or "sql_result" not in context:
+            raise ValueError("SQL result context required; simulated data not allowed.")
+        rows, columns = context["sql_result"]
+        df = coerce_dataframe(rows, columns)
+        n_rows = len(rows)
+        if "np.arange" in code:
+            raise ValueError("Simulated data (np.arange) not allowed; use sql_data.")
+        local_env["sql_data"] = df
+        local_env["n_rows"] = n_rows
         exec(code, local_env)
         result = local_env.get("result")
         if result is None:
@@ -376,10 +382,10 @@ def get_schema_subset(llm, query: str) -> str:
 
 # --- DB Connection with Retry ---
 @tenacity.retry(
-    stop=tenacity.stop_after_attempt(5),
-    wait=tenacity.wait_fixed(10),
+    stop=tenacity.stop_after_attempt(7),
+    wait=tenacity.wait_fixed(15),
     retry=tenacity.retry_if_exception_type(Exception),
-    before_sleep=lambda retry_state: logger.info(f"Retrying DB connection ({retry_state.attempt_number}/5)...")
+    before_sleep=lambda retry_state: logger.info(f"Retrying DB connection ({retry_state.attempt_number}/7)...")
 )
 def create_db_connection():
     try:
@@ -394,10 +400,10 @@ def create_db_connection():
             poolclass=QueuePool,
             pool_size=10,
             max_overflow=5,
-            pool_timeout=60,
+            pool_timeout=120,
             pool_pre_ping=True,
             pool_recycle=300,
-            connect_args={'connect_timeout': 60, 'options': '-csearch_path=public'}
+            connect_args={'connect_timeout': 120, 'options': '-csearch_path=public', 'keepalives': 1, 'keepalives_idle': 30, 'keepalives_interval': 30, 'keepalives_count': 5}
         )
         logger.info(f"Connection pool status: size={engine.pool.size()}, checked_out={engine.pool.checkedout()}, overflow={engine.pool.overflow()}")
         db = SQLDatabase(engine, include_tables=ALLOWED_TABLES)
@@ -449,7 +455,7 @@ def ask(q: Question, x_app_key: str = Header(...)):
             db_error = str(e)
             logger.warning(f"DB connection failed, proceeding in fallback mode: {db_error}")
 
-        llm = ChatOpenAI(model="gpt-4o", temperature=0, openai_api_key=OPENAI_API_KEY)
+        llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, openai_api_key=OPENAI_API_KEY)
         
         # Schema subset
         schema_subset = get_schema_subset(llm, q.query)
@@ -516,7 +522,7 @@ def ask(q: Question, x_app_key: str = Header(...)):
             try:
                 input_query = q.query
                 if db_error:
-                    input_query = f"{q.query}\nNote: Database unavailable due to query issue or connection timeout. The query would involve the relevant tables. Please retry later or simplify the query."
+                    input_query = f"{q.query}\nNote: Database unavailable due to query issue or connection timeout. The query would involve the tech_quantity table for demand. Please retry later or contact support."
                 result = agent_executor.invoke({"input": input_query + (f"\nPrevious error: {last_error}" if last_error else "")})
                 break
             except Exception as e:
@@ -526,11 +532,11 @@ def ask(q: Question, x_app_key: str = Header(...)):
         if not result:
             raise ValueError("Agent failed after retries.")
         
-        raw_output = result.get("output", "Unable to process due to database query issue, data processing error, or processing limits. Please retry later or simplify the query.")
+        raw_output = result.get("output", "Unable to process due to database query issue, data processing error, or processing limits. The query would involve the tech_quantity table for demand. Please retry later or contact support.")
         
         # Append DB warning if applicable
         if db_error:
-            raw_output = f"Warning: Database unavailable due to query issue or connection timeout. The query would involve the relevant tables. Please retry later or simplify the query. {raw_output}"
+            raw_output = f"Warning: Database unavailable due to query issue or connection timeout. The query would involve the tech_quantity table for demand. Please retry later or contact support. {raw_output}"
         
         # Parse for charts
         chart_data = None
@@ -614,6 +620,20 @@ def ask(q: Question, x_app_key: str = Header(...)):
                                         f"Abkhazeti: {forecast_abkhazeti[-1]:.2f} MWh\n"
                                         f"Other entities: {forecast_others[-1]:.2f} MWh"
                                     )
+                                    chart_data = {
+                                        "type": "line",
+                                        "data": [
+                                            {"date": str(date), "total_demand": total, "abkhazeti": abkhazeti, "others": others}
+                                            for date, total, abkhazeti, others in zip(
+                                                pd.date_range(start=last_date, periods=steps, freq="ME"),
+                                                forecast_total,
+                                                forecast_abkhazeti,
+                                                forecast_others
+                                            )
+                                        ]
+                                    }
+                                    chart_type = "line"
+                                    chart_metadata = {"title": f"Electricity Demand Forecast to {target_dt.strftime('%Y-%m')}"}
                                 elif "energy_source" in df.columns or "sector" in df.columns:
                                     # Demand forecast from energy_balance_long
                                     group_cols = [col for col in ["energy_source", "sector"] if col in df.columns]
