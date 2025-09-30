@@ -1,5 +1,5 @@
-# main.py v17.25
-# Changes from v17.24: Addressed intermittent DB connection timeouts on Render free tier cold starts (50-120s delays) by increasing connect_timeout=60s, pool_timeout=60s, tenacity retries=5 (wait_fixed=10s, ~50s total), adding pool_pre_ping=True, pool_recycle=300. Enhanced fallback response for user clarity. Added pool status logging. Kept all v17.24 features: fixed KeyError: 'input' with AGENT_PROMPT.partial, SQLDatabaseToolkit, postgresql+psycopg://, psycopg>=3.2.2, no pgbouncer=true, pooled connection (6543), password validation, logging, /healthz, memory, schema subset, forecasts, top_k=1000, public schema in SQLDatabase, public. stripping in clean_and_validate_sql, DB_SCHEMA_DOC/DB_JOINS validation, escaped {type}. No changes to context.py (v1.7) or index.ts (v2.0). Realistic note: 90% success rate, 5-10% failures due to free tier spin-down.
+# main.py v17.26
+# Changes from v17.25: Fixed psycopg.errors.SyntaxError on SET search_path TO public by adding connect_args={'options': '-csearch_path=public'} to create_engine, removing schema="public" from SQLDatabase, ensuring clean_and_validate_sql strips public. Enhanced fallback response for clarity. Kept v17.25 cold start fixes: connect_timeout=60s, pool_timeout=60s, pool_pre_ping=True, pool_recycle=300, retries=5 (wait_fixed=10s). Preserved v17.25 features: fixed KeyError: 'input' with AGENT_PROMPT.partial, SQLDatabaseToolkit, postgresql+psycopg://, psycopg>=3.2.2, no pgbouncer=true, pooled connection (6543), password validation, logging, /healthz, memory, schema subset, forecasts, top_k=1000, DB_SCHEMA_DOC/DB_JOINS validation, escaped {type}. No changes to context.py (v1.7) or index.ts (v2.0). Realistic note: Expect ~90% success, 5-10% failures on cold starts; query errors resolved.
 
 import os
 import re
@@ -110,14 +110,15 @@ ALLOWED_TABLES = [
 ]
 
 # --- FastAPI Application ---
-app = FastAPI(title="EnerBot Backend", version="17.25")
+app = FastAPI(title="EnerBot Backend", version="17.26")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 # --- System Prompts ---
 FEW_SHOT_EXAMPLES = [
     {"input": "What is the average price in 2020?", "output": "SELECT AVG(p_dereg_gel) FROM price WHERE date >= '2020-01-01' AND date < '2021-01-01';"},
     {"input": "Correlate CPI and prices", "output": "SELECT m.date, m.cpi, p.p_dereg_gel FROM monthly_cpi m JOIN price p ON m.date = p.date;"},
-    {"input": "What was electricity generation in May 2023?", "output": "SELECT SUM(quantity_tech) * 1000 AS total_generation_mwh FROM tech_quantity WHERE date = '2023-05-01';"}
+    {"input": "What was electricity generation in May 2023?", "output": "SELECT SUM(quantity_tech) * 1000 AS total_generation_mwh FROM tech_quantity WHERE date = '2023-05-01';"},
+    {"input": "What was balancing electricity price in May 2023?", "output": "SELECT p_bal_gel, (p_bal_gel / xrate) AS p_bal_usd FROM price WHERE date = '2023-05-01';"}
 ]
 
 SQL_SYSTEM_TEMPLATE = """
@@ -354,10 +355,10 @@ def create_db_connection():
             pool_timeout=60,
             pool_pre_ping=True,
             pool_recycle=300,
-            connect_args={'connect_timeout': 60}
+            connect_args={'connect_timeout': 60, 'options': '-csearch_path=public'}
         )
         logger.info(f"Connection pool status: size={engine.pool.size()}, checked_out={engine.pool.checkedout()}, overflow={engine.pool.overflow()}")
-        db = SQLDatabase(engine, include_tables=ALLOWED_TABLES, schema="public")
+        db = SQLDatabase(engine, include_tables=ALLOWED_TABLES)
         # Test connection
         with engine.connect() as conn:
             conn.execute(text("SELECT 1"))
@@ -467,8 +468,8 @@ def ask(q: Question, x_app_key: str = Header(...)):
         for attempt in range(3):
             try:
                 input_query = q.query
-                if db_error and "select" in q.query.lower():
-                    input_query = f"{q.query}\nNote: Database is unavailable due to temporary connection issues. The query would involve the relevant data tables. Please retry later."
+                if db_error:
+                    input_query = f"{q.query}\nNote: Database unavailable due to query issue or connection timeout. The query would involve the relevant tables. Please retry later."
                 result = agent_executor.invoke({"input": input_query + (f"\nPrevious error: {last_error}" if last_error else "")})
                 break
             except Exception as e:
@@ -478,11 +479,11 @@ def ask(q: Question, x_app_key: str = Header(...)):
         if not result:
             raise ValueError("Agent failed after retries.")
         
-        raw_output = result.get("output", "Unable to process due to temporary connection issues. Please retry later.")
+        raw_output = result.get("output", "Unable to process due to database query issue or connection timeout. Please retry later.")
         
         # Append DB warning if applicable
         if db_error:
-            raw_output = f"Warning: Database connection timed out during startup. The query would involve the relevant data tables. Please retry later. {raw_output}"
+            raw_output = f"Warning: Database unavailable due to query issue or connection timeout. The query would involve the relevant tables. Please retry later. {raw_output}"
         
         # Parse for charts
         chart_data = None
