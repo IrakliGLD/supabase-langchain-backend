@@ -1,5 +1,5 @@
-# main.py v17.35
-# Changes from v17.34: Fixed context passing in /ask to ensure sql_result is passed to execute_python_code for forecasts. Reinforced p_bal_usd calculation (p_bal_gel / xrate) in SQL_SYSTEM_TEMPLATE, AGENT_PROMPT, and FEW_SHOT_EXAMPLES. Kept gpt-4o-mini (~$0.003/query), forecasting (p_bal_gel/p_bal_usd yearly/summer/winter, tech_quantity total/Abkhazeti/others, energy_balance_long energy_source/sector), blocked variables (p_dereg_gel, p_gcap_gel, tariff_gel, hydro, wind, thermal, import, export), max_iterations=12, RateLimitError retries, freq='ME', connect_timeout=120s, pool_timeout=120s, retries=7, connect_args={'options': '-csearch_path=public', 'keepalives': 1, 'keepalives_idle': 30, 'keepalives_interval': 30, 'keepalives_count': 5}, pool_pre_ping=True, pool_recycle=300, SQLDatabaseToolkit, postgresql+psycopg://, psycopg>=3.2.2, no pgbouncer=true, logging, /healthz, memory, top_k=1000, DB_SCHEMA_DOC/DB_JOINS, openai>=1.0.0. No changes to context.py (v1.7), index.ts (v2.0). Realistic: ~90% success, 5-10% cold start failures.
+# main.py v17.36
+# Changes from v17.35: Added model selector (MODEL_TYPE=gemini|gpt) to support Gemini 1.5 Flash and GPT-4o-mini. Fixed context passing in /ask to ensure sql_result is passed to execute_python_code for forecasts. Added google-generativeai>=0.8.0 dependency and GOOGLE_API_KEY support. Reinforced p_bal_usd calculation (p_bal_gel / xrate) in SQL_SYSTEM_TEMPLATE, AGENT_PROMPT, and FEW_SHOT_EXAMPLES. Kept forecasting (p_bal_gel/p_bal_usd yearly/summer/winter, tech_quantity total/Abkhazeti/others, energy_balance_long energy_source/sector), blocked variables (p_dereg_gel, p_gcap_gel, tariff_gel, hydro, wind, thermal, import, export), max_iterations=12, RateLimitError retries, freq='ME', connect_timeout=120s, pool_timeout=120s, retries=7, connect_args={'options': '-csearch_path=public', 'keepalives': 1, 'keepalives_idle': 30, 'keepalives_interval': 30, 'keepalives_count': 5}, pool_pre_ping=True, pool_recycle=300, SQLDatabaseToolkit, postgresql+psycopg://, psycopg>=3.2.2, openai>=1.0.0, logging, /healthz, memory, top_k=1000, DB_SCHEMA_DOC/DB_JOINS. No changes to context.py (v1.7), index.ts (v2.0). Realistic: ~90% success, 5-10% cold start failures.
 
 import os
 import re
@@ -22,6 +22,7 @@ from psycopg import OperationalError as PsycopgOperationalError
 from openai import RateLimitError
 
 from langchain_openai import ChatOpenAI
+from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_community.utilities import SQLDatabase
 from langchain_community.agent_toolkits import SQLDatabaseToolkit
 from langchain.agents import create_openai_tools_agent, AgentExecutor
@@ -47,11 +48,17 @@ logger = logging.getLogger("enerbot")
 
 load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 SUPABASE_DB_URL = os.getenv("SUPABASE_DB_URL")
 APP_SECRET_KEY = os.getenv("APP_SECRET_KEY")
+MODEL_TYPE = os.getenv("MODEL_TYPE", "gpt")  # Default to GPT-4o-mini
 
-if not all([OPENAI_API_KEY, SUPABASE_DB_URL, APP_SECRET_KEY]):
-    raise RuntimeError("One or more essential environment variables are missing.")
+if not SUPABASE_DB_URL or not APP_SECRET_KEY:
+    raise RuntimeError("SUPABASE_DB_URL and APP_SECRET_KEY are required.")
+if MODEL_TYPE == "gpt" and not OPENAI_API_KEY:
+    raise RuntimeError("OPENAI_API_KEY required for MODEL_TYPE=gpt.")
+if MODEL_TYPE == "gemini" and not GOOGLE_API_KEY:
+    raise RuntimeError("GOOGLE_API_KEY required for MODEL_TYPE=gemini.")
 
 # Validate SUPABASE_DB_URL
 def validate_supabase_url(url: str) -> None:
@@ -114,7 +121,7 @@ ALLOWED_TABLES = [
 schema_cache = {}
 
 # --- FastAPI Application ---
-app = FastAPI(title="EnerBot Backend", version="17.35")
+app = FastAPI(title="EnerBot Backend", version="17.36")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 # --- System Prompts ---
@@ -479,7 +486,13 @@ def ask(q: Question, x_app_key: str = Header(...)):
             db_error = str(e)
             logger.warning(f"DB connection failed, proceeding in fallback mode: {db_error}")
 
-        llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, openai_api_key=OPENAI_API_KEY)
+        # Initialize LLM based on MODEL_TYPE
+        if MODEL_TYPE == "gemini":
+            llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0, google_api_key=GOOGLE_API_KEY)
+            logger.info("Using Gemini 1.5 Flash model")
+        else:
+            llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, openai_api_key=OPENAI_API_KEY)
+            logger.info("Using GPT-4o-mini model")
         
         # Schema subset
         schema_subset = get_schema_subset(llm, q.query)
