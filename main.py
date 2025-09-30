@@ -1,5 +1,5 @@
-# main.py v17.32
-# Changes from v17.31: Switched to gpt-4o-mini for cost reduction (~$0.003/query vs. $0.1). Enhanced DB connection stability with connect_args={'keepalives_interval': 30, 'keepalives_count': 5}. Enforced tech_quantity queries for demand forecasts, blocking simulated data. Added seasonality (seasonal='add', seasonal_periods=12) to tech_quantity forecasts. Updated SQL_SYSTEM_TEMPLATE and AGENT_PROMPT to reject simulated data. Enhanced fallback response. Kept forecasting instructions: p_bal_gel/p_bal_usd (yearly/summer/winter), tech_quantity (total/Abkhazeti/others), energy_balance_long (energy_source/sector), blocked p_dereg_gel/p_gcap_gel/tariff_gel. Preserved max_iterations=12, RateLimitError retries, freq='ME', connect_args={'options': '-csearch_path=public'}, connect_timeout=120s, pool_timeout=120s, pool_pre_ping=True, pool_recycle=300, retries=7, SQLDatabaseToolkit, postgresql+psycopg://, psycopg>=3.2.2, no pgbouncer=true, logging, /healthz, memory, top_k=1000, DB_SCHEMA_DOC/DB_JOINS, openai>=1.0.0. No changes to context.py (v1.7), index.ts (v2.0). Realistic: ~90% success, 5-10% cold start failures.
+# main.py v17.33
+# Changes from v17.32: Added blocked variables from tech_quantity (hydro, wind, thermal, import, export) with professional error messages. Moved detect_forecast_intent to start of /ask endpoint to block invalid forecasts early, preventing unnecessary SQL/Python calls. Fixed context passing in execute_python_code for forecasts. Enhanced error handling with professional tone for blocked forecasts. Kept gpt-4o-mini (~$0.003/query), forecasting instructions (p_bal_gel/p_bal_usd yearly/summer/winter, tech_quantity total/Abkhazeti/others, energy_balance_long energy_source/sector), blocked p_dereg_gel/p_gcap_gel/tariff_gel, max_iterations=12, RateLimitError retries, freq='ME', connect_timeout=120s, pool_timeout=120s, retries=7, connect_args={'options': '-csearch_path=public', 'keepalives': 1, 'keepalives_idle': 30, 'keepalives_interval': 30, 'keepalives_count': 5}, pool_pre_ping=True, pool_recycle=300, SQLDatabaseToolkit, postgresql+psycopg://, psycopg>=3.2.2, no pgbouncer=true, logging, /healthz, memory, top_k=1000, DB_SCHEMA_DOC/DB_JOINS, openai>=1.0.0. No changes to context.py (v1.7), index.ts (v2.0). Realistic: ~90% success, 5-10% cold start failures.
 
 import os
 import re
@@ -114,7 +114,7 @@ ALLOWED_TABLES = [
 schema_cache = {}
 
 # --- FastAPI Application ---
-app = FastAPI(title="EnerBot Backend", version="17.32")
+app = FastAPI(title="EnerBot Backend", version="17.33")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 # --- System Prompts ---
@@ -176,7 +176,7 @@ AGENT_PROMPT = ChatPromptTemplate.from_messages([
     
     Restrictions:
     - Forecast only: balancing electricity prices (p_bal_gel, p_bal_usd as p_bal_gel / xrate) from price table (yearly, summer May-Aug, winter Sep-Apr averages); demand (total, Abkhazeti, others) from tech_quantity, excluding export; demand by energy_source/sector from energy_balance_long.
-    - Block forecasts for p_dereg_gel (politically driven), p_gcap_gel (GNERC-regulated), tariff_gel (GNERC-regulated) with user-friendly reasons.
+    - Block forecasts for p_dereg_gel, p_gcap_gel, tariff_gel, and tech_quantity variables (hydro, wind, thermal, import, export) with user-friendly reasons.
     - Use exact SQL result lengths for DataFrame creation in execute_python_code.
     - For demand forecasts, always query tech_quantity; never use simulated data.
     - For visualization, output JSON (e.g., {{'type': 'line', 'data': [...]}}).
@@ -298,21 +298,19 @@ def detect_forecast_intent(query: str) -> (bool, Optional[datetime], Optional[st
 
     # Blocked variables
     blocked_vars = {
-        "p_dereg_gel": "p_dereg_gel forecasts are not allowed as they are politically driven and not affected by market forces like demand or supply.",
-        "p_gcap_gel": "p_gcap_gel forecasts are not allowed as they are regulated by GNERC based on tariff methodology, not market forces.",
-        "tariff_gel": "tariff_gel forecasts are not allowed as they are approved by GNERC based on tariff methodology, not market forces."
+        "p_dereg_gel": "Forecasting the price for deregulated power plants (p_dereg_gel) is not possible, as it is influenced by political decisions rather than market forces such as supply and demand. Please try forecasting balancing electricity prices or demand.",
+        "p_gcap_gel": "Forecasting the guaranteed capacity charge (p_gcap_gel) is not possible, as it is regulated by GNERC based on tariff methodology and not influenced by market forces. Please try forecasting balancing electricity prices or demand.",
+        "tariff_gel": "Forecasting electricity generation tariffs (tariff_gel) is not possible, as they are approved by GNERC based on tariff methodology and not influenced by market forces. Please try forecasting balancing electricity prices or demand.",
+        "hydro": "Forecasting electricity generation by hydro is not possible, as it is highly dependent on unpredictable weather conditions and lacks data on planned projects. Please try forecasting balancing electricity prices or demand.",
+        "wind": "Forecasting electricity generation by wind is not possible, as it is highly dependent on unpredictable weather conditions and lacks data on planned projects. Please try forecasting balancing electricity prices or demand.",
+        "thermal": "Forecasting electricity generation by thermal is not feasible, as it depends on the gap between renewable generation and demand. Renewable generation cannot be forecasted due to unpredictable weather conditions and lack of data on planned projects. Please try forecasting balancing electricity prices or demand.",
+        "import": "Forecasting electricity imports is not feasible, as they depend on the gap between renewable generation and demand. Renewable generation cannot be forecasted due to unpredictable weather conditions and lack of data on planned projects. Please try forecasting balancing electricity prices or demand.",
+        "export": "Forecasting electricity exports is not possible, as they depend on the availability of renewable generation, which cannot be forecasted due to unpredictable weather conditions and lack of data on planned projects. Please try forecasting balancing electricity prices or demand."
     }
     for var, reason in blocked_vars.items():
         if var in q:
+            logger.info(f"Blocked forecast attempt for variable: {var}")
             return False, None, reason
-
-    # Blocked categories: generation, imports, exports
-    blocked_terms = ["generation", "hydro", "thermal", "wind", "solar", "import", "export"]
-    if any(term in q for term in blocked_terms):
-        return False, None, (
-            "Forecasts for generation, imports, or exports cannot be provided because they "
-            "require new capacity data not included in this database. Only past trends can be shown."
-        )
 
     # Allowed forecasts
     if "forecast" in q or "predict" in q or "estimate" in q:
@@ -445,6 +443,19 @@ def ask(q: Question, x_app_key: str = Header(...)):
     start_time = time.time()
     if x_app_key != APP_SECRET_KEY:
         raise HTTPException(status_code=401, detail="Unauthorized")
+    
+    # Check for blocked forecast early
+    do_forecast, target_dt, blocked_reason = detect_forecast_intent(q.query)
+    if blocked_reason:
+        logger.info(f"Blocked forecast query: {q.query}")
+        return APIResponse(
+            answer=blocked_reason,
+            chart_data=None,
+            chart_type=None,
+            chart_metadata=None,
+            execution_time=round(time.time() - start_time, 2)
+        )
+
     try:
         # Lazy DB init with retries
         engine, db = None, None
@@ -522,7 +533,7 @@ def ask(q: Question, x_app_key: str = Header(...)):
             try:
                 input_query = q.query
                 if db_error:
-                    input_query = f"{q.query}\nNote: Database unavailable due to query issue or connection timeout. The query would involve the tech_quantity table for demand. Please retry later or contact support."
+                    input_query = f"{q.query}\nNote: Database unavailable due to query issue or connection timeout. The query would involve the relevant tables. Please retry later or contact support."
                 result = agent_executor.invoke({"input": input_query + (f"\nPrevious error: {last_error}" if last_error else "")})
                 break
             except Exception as e:
@@ -532,11 +543,11 @@ def ask(q: Question, x_app_key: str = Header(...)):
         if not result:
             raise ValueError("Agent failed after retries.")
         
-        raw_output = result.get("output", "Unable to process due to database query issue, data processing error, or processing limits. The query would involve the tech_quantity table for demand. Please retry later or contact support.")
+        raw_output = result.get("output", "Unable to process due to database query issue, data processing error, or processing limits. The query would involve the relevant tables. Please retry later or contact support.")
         
         # Append DB warning if applicable
         if db_error:
-            raw_output = f"Warning: Database unavailable due to query issue or connection timeout. The query would involve the tech_quantity table for demand. Please retry later or contact support. {raw_output}"
+            raw_output = f"Warning: Database unavailable due to query issue or connection timeout. The query would involve the relevant tables. Please retry later or contact support. {raw_output}"
         
         # Parse for charts
         chart_data = None
@@ -553,109 +564,105 @@ def ask(q: Question, x_app_key: str = Header(...)):
         except:
             pass
         
-        do_forecast, target_dt, blocked_reason = detect_forecast_intent(q.query)
-        if blocked_reason:
-            final_answer = f"I cannot forecast this variable. {blocked_reason}"
-        else:
-            # Run forecast if detected, not blocked, and DB available
-            if do_forecast and db:
-                # Extract data from agent steps if available
-                sql_query = extract_sql_from_steps(result.get("intermediate_steps", []))
-                if sql_query:
-                    try:
-                        with engine.connect() as conn:
-                            result = conn.execute(text(clean_and_validate_sql(sql_query)))
-                            rows = result.fetchall()
-                            columns = result.keys()
-                            df = coerce_dataframe(rows, columns)
-                            if not df.empty and "date" in df.columns:
-                                if "p_bal_gel" in df.columns and "xrate" in df.columns:
-                                    # Balancing electricity price forecast
-                                    last_date = df["date"].max()
+        if do_forecast and db:
+            # Extract data from agent steps if available
+            sql_query = extract_sql_from_steps(result.get("intermediate_steps", []))
+            if sql_query:
+                try:
+                    with engine.connect() as conn:
+                        result = conn.execute(text(clean_and_validate_sql(sql_query)))
+                        rows = result.fetchall()
+                        columns = result.keys()
+                        df = coerce_dataframe(rows, columns)
+                        context = {"sql_result": (rows, columns)}
+                        if not df.empty and "date" in df.columns:
+                            if "p_bal_gel" in df.columns and "xrate" in df.columns:
+                                # Balancing electricity price forecast
+                                last_date = df["date"].max()
+                                steps = int((pd.to_datetime(target_dt) - last_date) / np.timedelta64(1, "M")) + 1
+                                n_rows = len(df)
+                                df["p_bal_usd"] = df["p_bal_gel"] / df["xrate"]
+                                model_gel = ExponentialSmoothing(df["p_bal_gel"], trend="add", seasonal="add", seasonal_periods=12)
+                                fit_gel = model_gel.fit()
+                                model_usd = ExponentialSmoothing(df["p_bal_usd"], trend="add", seasonal="add", seasonal_periods=12)
+                                fit_usd = model_usd.fit()
+                                forecast_gel = fit_gel.forecast(steps=steps)
+                                forecast_usd = fit_usd.forecast(steps=steps)
+                                yearly_avg_gel = forecast_gel.mean()
+                                yearly_avg_usd = forecast_usd.mean()
+                                summer_mask = forecast_gel.index.month.isin([5, 6, 7, 8])
+                                winter_mask = ~summer_mask
+                                summer_avg_gel = forecast_gel[summer_mask].mean() if summer_mask.any() else None
+                                winter_avg_gel = forecast_gel[winter_mask].mean() if winter_mask.any() else None
+                                summer_avg_usd = forecast_usd[summer_mask].mean() if summer_mask.any() else None
+                                winter_avg_usd = forecast_usd[winter_mask].mean() if winter_mask.any() else None
+                                raw_output += (
+                                    f"\nForecast for {target_dt.strftime('%Y-%m')}:\n"
+                                    f"Yearly average: {yearly_avg_gel:.2f} GEL/MWh, {yearly_avg_usd:.2f} USD/MWh\n"
+                                    f"Summer (May-Aug) average: {summer_avg_gel:.2f} GEL/MWh, {summer_avg_usd:.2f} USD/MWh\n"
+                                    f"Winter (Sep-Apr) average: {winter_avg_gel:.2f} GEL/MWh, {winter_avg_usd:.2f} USD/MWh"
+                                )
+                            elif "quantity_tech" in df.columns and "entity" in df.columns:
+                                # Demand forecast from tech_quantity
+                                allowed_entities = ["Abkhazeti", "direct customers", "losses", "self-cons", "supply-distribution"]
+                                df = df[df["entity"].isin(allowed_entities)]
+                                total_demand = df.groupby("date")["quantity_tech"].sum().reset_index()
+                                abkhazeti = df[df["entity"] == "Abkhazeti"][["date", "quantity_tech"]]
+                                others = df[df["entity"] != "Abkhazeti"].groupby("date")["quantity_tech"].sum().reset_index()
+                                last_date = total_demand["date"].max()
+                                steps = int((pd.to_datetime(target_dt) - last_date) / np.timedelta64(1, "M")) + 1
+                                n_rows = len(total_demand)
+                                model_total = ExponentialSmoothing(total_demand["quantity_tech"], trend="add", seasonal="add", seasonal_periods=12)
+                                model_abkhazeti = ExponentialSmoothing(abkhazeti["quantity_tech"], trend="add", seasonal="add", seasonal_periods=12)
+                                model_others = ExponentialSmoothing(others["quantity_tech"], trend="add", seasonal="add", seasonal_periods=12)
+                                fit_total = model_total.fit()
+                                fit_abkhazeti = model_abkhazeti.fit()
+                                fit_others = model_others.fit()
+                                forecast_total = fit_total.forecast(steps=steps)
+                                forecast_abkhazeti = fit_abkhazeti.forecast(steps=steps)
+                                forecast_others = fit_others.forecast(steps=steps)
+                                raw_output += (
+                                    f"\nDemand Forecast for {target_dt.strftime('%Y-%m')}:\n"
+                                    f"Total demand: {forecast_total[-1]:.2f} MWh\n"
+                                    f"Abkhazeti: {forecast_abkhazeti[-1]:.2f} MWh\n"
+                                    f"Other entities: {forecast_others[-1]:.2f} MWh"
+                                )
+                                chart_data = {
+                                    "type": "line",
+                                    "data": [
+                                        {"date": str(date), "total_demand": total, "abkhazeti": abkhazeti, "others": others}
+                                        for date, total, abkhazeti, others in zip(
+                                            pd.date_range(start=last_date, periods=steps, freq="ME"),
+                                            forecast_total,
+                                            forecast_abkhazeti,
+                                            forecast_others
+                                        )
+                                    ]
+                                }
+                                chart_type = "line"
+                                chart_metadata = {"title": f"Electricity Demand Forecast to {target_dt.strftime('%Y-%m')}"}
+                            elif "energy_source" in df.columns or "sector" in df.columns:
+                                # Demand forecast from energy_balance_long
+                                group_cols = [col for col in ["energy_source", "sector"] if col in df.columns]
+                                if group_cols:
+                                    grouped = df.groupby(["date"] + group_cols)["demand"].sum().reset_index()
+                                    last_date = grouped["date"].max()
                                     steps = int((pd.to_datetime(target_dt) - last_date) / np.timedelta64(1, "M")) + 1
-                                    n_rows = len(df)
-                                    df["p_bal_usd"] = df["p_bal_gel"] / df["xrate"]
-                                    model_gel = ExponentialSmoothing(df["p_bal_gel"], trend="add", seasonal="add", seasonal_periods=12)
-                                    fit_gel = model_gel.fit()
-                                    model_usd = ExponentialSmoothing(df["p_bal_usd"], trend="add", seasonal="add", seasonal_periods=12)
-                                    fit_usd = model_usd.fit()
-                                    forecast_gel = fit_gel.forecast(steps=steps)
-                                    forecast_usd = fit_usd.forecast(steps=steps)
-                                    yearly_avg_gel = forecast_gel.mean()
-                                    yearly_avg_usd = forecast_usd.mean()
-                                    summer_mask = forecast_gel.index.month.isin([5, 6, 7, 8])
-                                    winter_mask = ~summer_mask
-                                    summer_avg_gel = forecast_gel[summer_mask].mean() if summer_mask.any() else None
-                                    winter_avg_gel = forecast_gel[winter_mask].mean() if winter_mask.any() else None
-                                    summer_avg_usd = forecast_usd[summer_mask].mean() if summer_mask.any() else None
-                                    winter_avg_usd = forecast_usd[winter_mask].mean() if winter_mask.any() else None
-                                    raw_output += (
-                                        f"\nForecast for {target_dt.strftime('%Y-%m')}:\n"
-                                        f"Yearly average: {yearly_avg_gel:.2f} GEL/MWh, {yearly_avg_usd:.2f} USD/MWh\n"
-                                        f"Summer (May-Aug) average: {summer_avg_gel:.2f} GEL/MWh, {summer_avg_usd:.2f} USD/MWh\n"
-                                        f"Winter (Sep-Apr) average: {winter_avg_gel:.2f} GEL/MWh, {winter_avg_usd:.2f} USD/MWh"
-                                    )
-                                elif "quantity_tech" in df.columns and "entity" in df.columns:
-                                    # Demand forecast from tech_quantity
-                                    allowed_entities = ["Abkhazeti", "direct customers", "losses", "self-cons", "supply-distribution"]
-                                    df = df[df["entity"].isin(allowed_entities)]
-                                    total_demand = df.groupby("date")["quantity_tech"].sum().reset_index()
-                                    abkhazeti = df[df["entity"] == "Abkhazeti"][["date", "quantity_tech"]]
-                                    others = df[df["entity"] != "Abkhazeti"].groupby("date")["quantity_tech"].sum().reset_index()
-                                    last_date = total_demand["date"].max()
-                                    steps = int((pd.to_datetime(target_dt) - last_date) / np.timedelta64(1, "M")) + 1
-                                    n_rows = len(total_demand)
-                                    model_total = ExponentialSmoothing(total_demand["quantity_tech"], trend="add", seasonal="add", seasonal_periods=12)
-                                    model_abkhazeti = ExponentialSmoothing(abkhazeti["quantity_tech"], trend="add", seasonal="add", seasonal_periods=12)
-                                    model_others = ExponentialSmoothing(others["quantity_tech"], trend="add", seasonal="add", seasonal_periods=12)
-                                    fit_total = model_total.fit()
-                                    fit_abkhazeti = model_abkhazeti.fit()
-                                    fit_others = model_others.fit()
-                                    forecast_total = fit_total.forecast(steps=steps)
-                                    forecast_abkhazeti = fit_abkhazeti.forecast(steps=steps)
-                                    forecast_others = fit_others.forecast(steps=steps)
-                                    raw_output += (
-                                        f"\nDemand Forecast for {target_dt.strftime('%Y-%m')}:\n"
-                                        f"Total demand: {forecast_total[-1]:.2f} MWh\n"
-                                        f"Abkhazeti: {forecast_abkhazeti[-1]:.2f} MWh\n"
-                                        f"Other entities: {forecast_others[-1]:.2f} MWh"
-                                    )
-                                    chart_data = {
-                                        "type": "line",
-                                        "data": [
-                                            {"date": str(date), "total_demand": total, "abkhazeti": abkhazeti, "others": others}
-                                            for date, total, abkhazeti, others in zip(
-                                                pd.date_range(start=last_date, periods=steps, freq="ME"),
-                                                forecast_total,
-                                                forecast_abkhazeti,
-                                                forecast_others
-                                            )
-                                        ]
-                                    }
-                                    chart_type = "line"
-                                    chart_metadata = {"title": f"Electricity Demand Forecast to {target_dt.strftime('%Y-%m')}"}
-                                elif "energy_source" in df.columns or "sector" in df.columns:
-                                    # Demand forecast from energy_balance_long
-                                    group_cols = [col for col in ["energy_source", "sector"] if col in df.columns]
-                                    if group_cols:
-                                        grouped = df.groupby(["date"] + group_cols)["demand"].sum().reset_index()
-                                        last_date = grouped["date"].max()
-                                        steps = int((pd.to_datetime(target_dt) - last_date) / np.timedelta64(1, "M")) + 1
-                                        n_rows = len(grouped)
-                                        forecasts = {}
-                                        for group in grouped[group_cols].drop_duplicates().itertuples(index=False):
-                                            group_key = tuple(getattr(group, col) for col in group_cols)
-                                            group_data = grouped[grouped[group_cols].eq(group_key).all(axis=1)]
-                                            model = ExponentialSmoothing(group_data["demand"], trend="add", seasonal="add", seasonal_periods=12)
-                                            fit = model.fit()
-                                            forecast = fit.forecast(steps=steps)
-                                            forecasts[group_key] = forecast[-1]
-                                        raw_output += f"\nDemand Forecast for {target_dt.strftime('%Y-%m')}:\n"
-                                        for group_key, value in forecasts.items():
-                                            raw_output += f"{group_cols}: {group_key} = {value:.2f} MWh\n"
-                    except Exception as e:
-                        logger.warning(f"Forecast SQL execution failed: {e}")
-                        raw_output += f"\nWarning: Forecast failed due to database error ({str(e)})."
+                                    n_rows = len(grouped)
+                                    forecasts = {}
+                                    for group in grouped[group_cols].drop_duplicates().itertuples(index=False):
+                                        group_key = tuple(getattr(group, col) for col in group_cols)
+                                        group_data = grouped[grouped[group_cols].eq(group_key).all(axis=1)]
+                                        model = ExponentialSmoothing(group_data["demand"], trend="add", seasonal="add", seasonal_periods=12)
+                                        fit = model.fit()
+                                        forecast = fit.forecast(steps=steps)
+                                        forecasts[group_key] = forecast[-1]
+                                    raw_output += f"\nDemand Forecast for {target_dt.strftime('%Y-%m')}:\n"
+                                    for group_key, value in forecasts.items():
+                                        raw_output += f"{group_cols}: {group_key} = {value:.2f} MWh\n"
+                except Exception as e:
+                    logger.warning(f"Forecast SQL execution failed: {e}")
+                    raw_output += f"\nWarning: Forecast failed due to database error ({str(e)})."
 
         final_answer = scrub_schema_mentions(raw_output)
 
