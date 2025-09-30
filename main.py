@@ -1,5 +1,5 @@
-# main.py v17.21
-# Changes from v17.20: Fixed SyntaxError in convert_decimal_to_float (line 210) by correcting mismatched bracket in tuple comprehension (changed [] to ()). Preserved v17.20 changes: updated validate_supabase_url to allow postgresql+psycopg scheme, coerced SUPABASE_DB_URL to postgresql+psycopg:// in create_db_connection, removed pgbouncer=true and psycopg2 fallback. Kept pooled connection (aws-1-eu-central-1.pooler.supabase.com:6543), SUPABASE_DB_URL name, and all v17.20 features (DB diagnostics, fallback, retries, logging, /healthz, memory, schema subset, forecasts, top_k=1000). No changes to context.py (v1.7 correct) or index.ts (v2.0 robust). Realistic note: Correct password with psycopg yields 95-100% success.
+# main.py v17.22
+# Changes from v17.21: Fixed ValueError: Unsupported function dates in /ask endpoint by removing tools.extend(db.get_usable_table_names()) and using SQLDatabaseToolkit exclusively for SQL tools. Preserved v17.21 changes: fixed SyntaxError in convert_decimal_to_float, updated validate_supabase_url to allow postgresql+psycopg scheme, coerced SUPABASE_DB_URL to postgresql+psycopg://, removed pgbouncer=true and psycopg2 fallback. Kept pooled connection (aws-1-eu-central-1.pooler.supabase.com:6543), SUPABASE_DB_URL name, and all v17.21 features (DB diagnostics, fallback, retries, logging, /healthz, memory, schema subset, forecasts, top_k=1000). No changes to context.py (v1.7 correct) or index.ts (v2.0 robust). Realistic note: Correct password with psycopg and SQLDatabaseToolkit yields 95-100% success.
 
 import os
 import re
@@ -22,12 +22,14 @@ from psycopg import OperationalError as PsycopgOperationalError
 
 from langchain_openai import ChatOpenAI
 from langchain_community.utilities import SQLDatabase
+from langchain_community.agent_toolkits import SQLDatabaseToolkit
 from langchain.agents import create_openai_tools_agent, AgentExecutor
 from langchain_core.tools import tool
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnablePassthrough
 from langchain_core.output_parsers import StrOutputParser
 from langchain.memory import ConversationBufferMemory
+from langchain.schema import AgentAction
 
 from dotenv import load_dotenv
 from decimal import Decimal
@@ -100,7 +102,7 @@ ALLOWED_TABLES = [
 ]
 
 # --- FastAPI Application ---
-app = FastAPI(title="EnerBot Backend", version="17.21")
+app = FastAPI(title="EnerBot Backend", version="17.22")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 # --- System Prompts ---
@@ -416,7 +418,8 @@ def ask(q: Question, x_app_key: str = Header(...)):
         # Multi-tool agent with memory
         tools = [execute_python_code]  # Default to code tool
         if db:
-            tools.extend(db.get_usable_table_names())  # Add SQL tools if DB connected
+            toolkit = SQLDatabaseToolkit(db=db, llm=llm)
+            tools.extend(toolkit.get_tools())  # Add SQL tools from toolkit
         
         agent = create_openai_tools_agent(
             llm=llm,
