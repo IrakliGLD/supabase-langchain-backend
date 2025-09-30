@@ -1,5 +1,5 @@
-# main.py v17.33
-# Changes from v17.32: Added blocked variables from tech_quantity (hydro, wind, thermal, import, export) with professional error messages. Moved detect_forecast_intent to start of /ask endpoint to block invalid forecasts early, preventing unnecessary SQL/Python calls. Fixed context passing in execute_python_code for forecasts. Enhanced error handling with professional tone for blocked forecasts. Kept gpt-4o-mini (~$0.003/query), forecasting instructions (p_bal_gel/p_bal_usd yearly/summer/winter, tech_quantity total/Abkhazeti/others, energy_balance_long energy_source/sector), blocked p_dereg_gel/p_gcap_gel/tariff_gel, max_iterations=12, RateLimitError retries, freq='ME', connect_timeout=120s, pool_timeout=120s, retries=7, connect_args={'options': '-csearch_path=public', 'keepalives': 1, 'keepalives_idle': 30, 'keepalives_interval': 30, 'keepalives_count': 5}, pool_pre_ping=True, pool_recycle=300, SQLDatabaseToolkit, postgresql+psycopg://, psycopg>=3.2.2, no pgbouncer=true, logging, /healthz, memory, top_k=1000, DB_SCHEMA_DOC/DB_JOINS, openai>=1.0.0. No changes to context.py (v1.7), index.ts (v2.0). Realistic: ~90% success, 5-10% cold start failures.
+# main.py v17.34
+# Changes from v17.33: Enhanced detect_forecast_intent with fuzzy matching for tariff_gel (e.g., 'tariff', 'enguri', 'hpp') and tech_quantity variables (hydro, wind, thermal, import, export) using regex. Moved detect_forecast_intent to start of /ask for early blocking. Fixed context passing in execute_python_code for forecasts. Updated blocked variable messages for professional tone. Added logging for bypassed queries. Kept gpt-4o-mini (~$0.003/query), forecasting (p_bal_gel/p_bal_usd yearly/summer/winter, tech_quantity total/Abkhazeti/others, energy_balance_long energy_source/sector), blocked variables (p_dereg_gel, p_gcap_gel, tariff_gel, hydro, wind, thermal, import, export), max_iterations=12, RateLimitError retries, freq='ME', connect_timeout=120s, pool_timeout=120s, retries=7, connect_args={'options': '-csearch_path=public', 'keepalives': 1, 'keepalives_idle': 30, 'keepalives_interval': 30, 'keepalives_count': 5}, pool_pre_ping=True, pool_recycle=300, SQLDatabaseToolkit, postgresql+psycopg://, psycopg>=3.2.2, no pgbouncer=true, logging, /healthz, memory, top_k=1000, DB_SCHEMA_DOC/DB_JOINS, openai>=1.0.0. No changes to context.py (v1.7), index.ts (v2.0). Realistic: ~90% success, 5-10% cold start failures.
 
 import os
 import re
@@ -114,7 +114,7 @@ ALLOWED_TABLES = [
 schema_cache = {}
 
 # --- FastAPI Application ---
-app = FastAPI(title="EnerBot Backend", version="17.33")
+app = FastAPI(title="EnerBot Backend", version="17.34")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 # --- System Prompts ---
@@ -124,7 +124,8 @@ FEW_SHOT_EXAMPLES = [
     {"input": "What was electricity generation in May 2023?", "output": "SELECT SUM(quantity_tech) * 1000 AS total_generation_mwh FROM tech_quantity WHERE date = '2023-05-01';"},
     {"input": "What was balancing electricity price in May 2023?", "output": "SELECT p_bal_gel, (p_bal_gel / xrate) AS p_bal_usd FROM price WHERE date = '2023-05-01';"},
     {"input": "Predict balancing electricity price by December 2035?", "output": "SELECT date, p_bal_gel, xrate FROM price ORDER BY date;"},
-    {"input": "Predict the electricity demand for 2030?", "output": "SELECT date, entity, quantity_tech FROM tech_quantity WHERE entity IN ('Abkhazeti', 'direct customers', 'losses', 'self-cons', 'supply-distribution') ORDER BY date;"}
+    {"input": "Predict the electricity demand for 2030?", "output": "SELECT date, entity, quantity_tech FROM tech_quantity WHERE entity IN ('Abkhazeti', 'direct customers', 'losses', 'self-cons', 'supply-distribution') ORDER BY date;"},
+    {"input": "Predict tariff for Enguri HPP?", "output": "SELECT 1;"}
 ]
 
 SQL_SYSTEM_TEMPLATE = """
@@ -296,7 +297,7 @@ def detect_forecast_intent(query: str) -> (bool, Optional[datetime], Optional[st
     """
     q = query.lower()
 
-    # Blocked variables
+    # Blocked variables with professional reasons
     blocked_vars = {
         "p_dereg_gel": "Forecasting the price for deregulated power plants (p_dereg_gel) is not possible, as it is influenced by political decisions rather than market forces such as supply and demand. Please try forecasting balancing electricity prices or demand.",
         "p_gcap_gel": "Forecasting the guaranteed capacity charge (p_gcap_gel) is not possible, as it is regulated by GNERC based on tariff methodology and not influenced by market forces. Please try forecasting balancing electricity prices or demand.",
@@ -307,10 +308,21 @@ def detect_forecast_intent(query: str) -> (bool, Optional[datetime], Optional[st
         "import": "Forecasting electricity imports is not feasible, as they depend on the gap between renewable generation and demand. Renewable generation cannot be forecasted due to unpredictable weather conditions and lack of data on planned projects. Please try forecasting balancing electricity prices or demand.",
         "export": "Forecasting electricity exports is not possible, as they depend on the availability of renewable generation, which cannot be forecasted due to unpredictable weather conditions and lack of data on planned projects. Please try forecasting balancing electricity prices or demand."
     }
+
+    # Fuzzy matching for blocked variables
     for var, reason in blocked_vars.items():
-        if var in q:
-            logger.info(f"Blocked forecast attempt for variable: {var}")
+        if var == "tariff_gel":
+            if re.search(r'\btariff\b|\benguri\b|\bhpp\b|\bhydropower\b', q, re.IGNORECASE):
+                logger.info(f"Blocked forecast attempt for tariff_gel: {q}")
+                return False, None, reason
+        elif re.search(rf'\b{var}\b', q, re.IGNORECASE):
+            logger.info(f"Blocked forecast attempt for {var}: {q}")
             return False, None, reason
+
+    # Fallback for generic tariff-related queries
+    if re.search(r'\btariff\b', q, re.IGNORECASE):
+        logger.info(f"Blocked forecast attempt for generic tariff: {q}")
+        return False, None, blocked_vars["tariff_gel"]
 
     # Allowed forecasts
     if "forecast" in q or "predict" in q or "estimate" in q:
@@ -599,8 +611,8 @@ def ask(q: Question, x_app_key: str = Header(...)):
                                 raw_output += (
                                     f"\nForecast for {target_dt.strftime('%Y-%m')}:\n"
                                     f"Yearly average: {yearly_avg_gel:.2f} GEL/MWh, {yearly_avg_usd:.2f} USD/MWh\n"
-                                    f"Summer (May-Aug) average: {summer_avg_gel:.2f} GEL/MWh, {summer_avg_usd:.2f} USD/MWh\n"
-                                    f"Winter (Sep-Apr) average: {winter_avg_gel:.2f} GEL/MWh, {winter_avg_usd:.2f} USD/MWh"
+                                    f"Summer (May-Aug) average: {summer_avg_gel:.2f} GEL/MWh, {yearly_avg_usd:.2f} USD/MWh\n"
+                                    f"Winter (Sep-Apr) average: {winter_avg_gel:.2f} GEL/MWh, {yearly_avg_usd:.2f} USD/MWh"
                                 )
                             elif "quantity_tech" in df.columns and "entity" in df.columns:
                                 # Demand forecast from tech_quantity
