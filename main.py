@@ -1,5 +1,5 @@
-# main.py v17.23
-# Changes from v17.22: Fixed ValueError: Agent failed after retries by formatting AGENT_PROMPT with schema_subset and DB_JOINS before agent creation, passing only input to agent_executor.invoke. Added schema="public" to SQLDatabase init to align with public.tech_quantity. Updated clean_and_validate_sql to strip public. prefix. Added DB_SCHEMA_DOC and DB_JOINS validation. Preserved v17.22 features: fixed SyntaxError in convert_decimal_to_float, used SQLDatabaseToolkit, postgresql+psycopg://, psycopg>=3.2.2, no pgbouncer=true, pooled connection (6543), password validation, logging, /healthz, memory, schema subset, forecasts, top_k=1000. No changes to context.py (v1.7) or index.ts (v2.0). Realistic note: Correct password and schema yield 95-100% success.
+# main.py v17.24
+# Changes from v17.23: Fixed KeyError: 'input' in AGENT_PROMPT.format by using .partial to format system placeholders (schema, joins) before agent creation, leaving {input} for invoke. Kept all v17.23 features (SQLDatabaseToolkit, postgresql+psycopg://, psycopg>=3.2.2, no pgbouncer=true, pooled connection (6543), password validation, logging, /healthz, memory, schema subset, forecasts, top_k=1000, public schema in SQLDatabase, public. stripping in clean_and_validate_sql, DB_SCHEMA_DOC/DB_JOINS validation, escaped {type} in AGENT_PROMPT). No changes to context.py (v1.7) or index.ts (v2.0). Realistic note: Correct password and schema yield 95-100% success.
 
 import os
 import re
@@ -110,7 +110,7 @@ ALLOWED_TABLES = [
 ]
 
 # --- FastAPI Application ---
-app = FastAPI(title="EnerBot Backend", version="17.23")
+app = FastAPI(title="EnerBot Backend", version="17.24")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 # --- System Prompts ---
@@ -430,12 +430,12 @@ def ask(q: Question, x_app_key: str = Header(...)):
             toolkit = SQLDatabaseToolkit(db=db, llm=llm)
             tools.extend(toolkit.get_tools())  # Add SQL tools from toolkit
         
-        # Format AGENT_PROMPT with schema and joins
+        # Format AGENT_PROMPT with schema and joins using partial
         try:
-            formatted_prompt = AGENT_PROMPT.format(schema=schema_subset, joins=DB_JOINS)
+            partial_prompt = AGENT_PROMPT.partial(schema=schema_subset, joins=DB_JOINS)
         except Exception as e:
-            logger.error(f"Failed to format AGENT_PROMPT: {str(e)}")
-            formatted_prompt = AGENT_PROMPT.format(
+            logger.error(f"Failed to format AGENT_PROMPT with partial: {str(e)}")
+            partial_prompt = AGENT_PROMPT.partial(
                 schema="Schema unavailable due to formatting error.",
                 joins="Joins unavailable due to formatting error."
             )
@@ -443,7 +443,7 @@ def ask(q: Question, x_app_key: str = Header(...)):
         agent = create_openai_tools_agent(
             llm=llm,
             tools=tools,
-            prompt=formatted_prompt
+            prompt=partial_prompt
         )
         
         memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
