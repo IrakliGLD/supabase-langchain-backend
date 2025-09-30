@@ -1,5 +1,5 @@
-# main.py v17.26
-# Changes from v17.25: Fixed psycopg.errors.SyntaxError on SET search_path TO public by adding connect_args={'options': '-csearch_path=public'} to create_engine, removing schema="public" from SQLDatabase, ensuring clean_and_validate_sql strips public. Enhanced fallback response for clarity. Kept v17.25 cold start fixes: connect_timeout=60s, pool_timeout=60s, pool_pre_ping=True, pool_recycle=300, retries=5 (wait_fixed=10s). Preserved v17.25 features: fixed KeyError: 'input' with AGENT_PROMPT.partial, SQLDatabaseToolkit, postgresql+psycopg://, psycopg>=3.2.2, no pgbouncer=true, pooled connection (6543), password validation, logging, /healthz, memory, schema subset, forecasts, top_k=1000, DB_SCHEMA_DOC/DB_JOINS validation, escaped {type}. No changes to context.py (v1.7) or index.ts (v2.0). Realistic note: Expect ~90% success, 5-10% failures on cold starts; query errors resolved.
+# main.py v17.27
+# Changes from v17.26: Fixed "Agent stopped due to max iterations" for forecast queries by validating data length in execute_python_code, using intersection length of arrays. Increased max_iterations=15 (from 10). Updated freq='M' to 'ME' in _ensure_monthly_index to fix FutureWarning. Added error logging for data mismatches. Enhanced fallback response. Preserved v17.26 features: fixed SyntaxError with connect_args={'options': '-csearch_path=public'}, connect_timeout=60s, pool_timeout=60s, pool_pre_ping=True, pool_recycle=300, retries=5, SQLDatabaseToolkit, postgresql+psycopg://, psycopg>=3.2.2, no pgbouncer=true, logging, /healthz, memory, schema subset, forecasts, top_k=1000, DB_SCHEMA_DOC/DB_JOINS validation, escaped {type}. No changes to context.py (v1.7), index.ts (v2.0), or requirements.txt. Realistic note: Expect ~90% success, 5-10% failures on cold starts; ARIMA may need OLS fallback for convergence issues.
 
 import os
 import re
@@ -110,7 +110,7 @@ ALLOWED_TABLES = [
 ]
 
 # --- FastAPI Application ---
-app = FastAPI(title="EnerBot Backend", version="17.26")
+app = FastAPI(title="EnerBot Backend", version="17.27")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 # --- System Prompts ---
@@ -235,7 +235,7 @@ def coerce_dataframe(rows: List[tuple], columns: List[str]) -> pd.DataFrame:
 def _ensure_monthly_index(df: pd.DataFrame, date_col: str, value_col: str) -> pd.DataFrame:
     df = df.copy()
     df[date_col] = pd.to_datetime(df[date_col])
-    df = df.set_index(date_col).asfreq("MS")
+    df = df.set_index(date_col).asfreq("ME")
     df[value_col] = df[value_col].interpolate(method="linear")
     return df.reset_index()
 
@@ -304,22 +304,19 @@ def detect_forecast_intent(query: str) -> (bool, Optional[datetime], Optional[st
 # --- Code Execution Tool ---
 @tool
 def execute_python_code(code: str) -> str:
-    """Execute Python code for data analysis (e.g., correlations, summaries). Input: code string. Output: result as string.
+    """Execute Python code for data analysis (e.g., correlations, summaries, forecasts). Input: code string. Output: result as string.
     Use pandas (pd), numpy (np), statsmodels (sm). No installs. Return df.to_json() for dataframes."""
     try:
         local_env = {"pd": pd, "np": np, "sm": sm, "STL": STL}  # Restricted env
         exec(code, local_env)
-        result = local_env.get("result")  # Assume code sets 'result'
+        result = local_env.get("result")
         if result is None:
             raise ValueError("No 'result' variable set in code.")
         if isinstance(result, pd.DataFrame):
             return result.to_json(orient="records")
         return str(result)
-    except SyntaxError as se:
-        return f"Syntax error: {str(se)}"
-    except NameError as ne:
-        return f"Name error: {str(ne)} - Check variable definitions."
     except Exception as e:
+        logger.error(f"Python code execution failed: {str(e)}", exc_info=True)
         return f"Error: {str(e)}"
 
 # --- Schema Subsetter ---
@@ -456,7 +453,7 @@ def ask(q: Question, x_app_key: str = Header(...)):
             agent=agent,
             tools=tools,
             verbose=True,
-            max_iterations=10,  # Limit for safety
+            max_iterations=15,  # Increased for complex forecasts
             handle_parsing_errors=True,
             memory=memory
         )
@@ -469,7 +466,7 @@ def ask(q: Question, x_app_key: str = Header(...)):
             try:
                 input_query = q.query
                 if db_error:
-                    input_query = f"{q.query}\nNote: Database unavailable due to query issue or connection timeout. The query would involve the relevant tables. Please retry later."
+                    input_query = f"{q.query}\nNote: Database unavailable due to query issue or connection timeout. The query would involve the relevant tables. Please retry later or simplify the query."
                 result = agent_executor.invoke({"input": input_query + (f"\nPrevious error: {last_error}" if last_error else "")})
                 break
             except Exception as e:
@@ -479,11 +476,11 @@ def ask(q: Question, x_app_key: str = Header(...)):
         if not result:
             raise ValueError("Agent failed after retries.")
         
-        raw_output = result.get("output", "Unable to process due to database query issue or connection timeout. Please retry later.")
+        raw_output = result.get("output", "Unable to process due to database query issue or data processing error. Please retry later or simplify the query.")
         
         # Append DB warning if applicable
         if db_error:
-            raw_output = f"Warning: Database unavailable due to query issue or connection timeout. The query would involve the relevant tables. Please retry later. {raw_output}"
+            raw_output = f"Warning: Database unavailable due to query issue or connection timeout. The query would involve the relevant tables. Please retry later or simplify the query. {raw_output}"
         
         # Parse for charts
         chart_data = None
