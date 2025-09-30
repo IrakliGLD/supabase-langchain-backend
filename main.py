@@ -1,6 +1,5 @@
-# main.py v17.36
-# Changes from v17.35: Added model selector (MODEL_TYPE=gemini|gpt) to support Gemini 1.5 Flash and GPT-4o-mini. Fixed context passing in /ask to ensure sql_result is passed to execute_python_code for forecasts. Added google-generativeai>=0.8.0 dependency and GOOGLE_API_KEY support. Reinforced p_bal_usd calculation (p_bal_gel / xrate) in SQL_SYSTEM_TEMPLATE, AGENT_PROMPT, and FEW_SHOT_EXAMPLES. Kept forecasting (p_bal_gel/p_bal_usd yearly/summer/winter, tech_quantity total/Abkhazeti/others, energy_balance_long energy_source/sector), blocked variables (p_dereg_gel, p_gcap_gel, tariff_gel, hydro, wind, thermal, import, export), max_iterations=12, RateLimitError retries, freq='ME', connect_timeout=120s, pool_timeout=120s, retries=7, connect_args={'options': '-csearch_path=public', 'keepalives': 1, 'keepalives_idle': 30, 'keepalives_interval': 30, 'keepalives_count': 5}, pool_pre_ping=True, pool_recycle=300, SQLDatabaseToolkit, postgresql+psycopg://, psycopg>=3.2.2, openai>=1.0.0, logging, /healthz, memory, top_k=1000, DB_SCHEMA_DOC/DB_JOINS. No changes to context.py (v1.7), index.ts (v2.0). Realistic: ~90% success, 5-10% cold start failures.
-
+# main.py v17.37
+# Changes from v17.36: Updated Gemini model to gemini-1.5-flash-latest (or GEMINI_MODEL env var) to fix 404 NotFound error. Kept model selector (MODEL_TYPE=gemini|gpt), context passing fix for execute_python_code, google-generativeai==0.8.2, openai==1.0.0, langchain-google-genai==0.2.0, p_bal_usd calculation (p_bal_gel / xrate), forecasting (p_bal_gel/p_bal_usd yearly/summer/winter, tech_quantity total/Abkhazeti/others, energy_balance_long energy_source/sector), blocked variables (p_dereg_gel, p_gcap_gel, tariff_gel, hydro, wind, thermal, import, export), max_iterations=12, RateLimitError retries, freq='ME', connect_timeout=120s, pool_timeout=120s, retries=7, connect_args={'options': '-csearch_path=public', 'keepalives': 1, 'keepalives_idle': 30, 'keepalives_interval': 30, 'keepalives_count': 5}, pool_pre_ping=True, pool_recycle=300, SQLDatabaseToolkit, postgresql+psycopg://, psycopg==3.2.2, logging, /healthz, memory, top_k=1000, DB_SCHEMA_DOC/DB_JOINS. No changes to context.py (v1.7), index.ts (v2.0). Realistic: ~90% success, 5-10% cold start failures.
 
 import os
 import re
@@ -53,6 +52,7 @@ GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
 SUPABASE_DB_URL = os.getenv("SUPABASE_DB_URL")
 APP_SECRET_KEY = os.getenv("APP_SECRET_KEY")
 MODEL_TYPE = os.getenv("MODEL_TYPE", "gpt")  # Default to GPT-4o-mini
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash-latest")  # Default to gemini-1.5-flash-latest
 
 if not SUPABASE_DB_URL or not APP_SECRET_KEY:
     raise RuntimeError("SUPABASE_DB_URL and APP_SECRET_KEY are required.")
@@ -122,7 +122,7 @@ ALLOWED_TABLES = [
 schema_cache = {}
 
 # --- FastAPI Application ---
-app = FastAPI(title="EnerBot Backend", version="17.36")
+app = FastAPI(title="EnerBot Backend", version="17.37")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 # --- System Prompts ---
@@ -489,8 +489,8 @@ def ask(q: Question, x_app_key: str = Header(...)):
 
         # Initialize LLM based on MODEL_TYPE
         if MODEL_TYPE == "gemini":
-            llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash", temperature=0, google_api_key=GOOGLE_API_KEY)
-            logger.info("Using Gemini 1.5 Flash model")
+            llm = ChatGoogleGenerativeAI(model=GEMINI_MODEL, temperature=0, google_api_key=GOOGLE_API_KEY)
+            logger.info(f"Using Gemini model: {GEMINI_MODEL}")
         else:
             llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, openai_api_key=OPENAI_API_KEY)
             logger.info("Using GPT-4o-mini model")
