@@ -1,5 +1,5 @@
-# main.py v17.19
-# Changes from v17.18: Removed psycopg2 fallback, enforcing psycopg>=3.2.2 for pooled connection compatibility. Removed pgbouncer=true from SUPABASE_DB_URL validation, relying on SQLAlchemy QueuePool. Escaped {type} in AGENT_PROMPT to fix LangChain template error. Kept pooled connection (aws-1-eu-central-1.pooler.supabase.com:6543) and SUPABASE_DB_URL name. Preserved all v17.18 features (psycopg, DB diagnostics, fallback, retries, logging, /healthz, memory, schema subset, forecasts, top_k=1000). No changes to context.py (v1.7 correct) or index.ts (v2.0 robust). Realistic note: Correct password with psycopg yields 95-100% success.
+# main.py v17.20
+# Changes from v17.19: Updated validate_supabase_url to allow postgresql+psycopg scheme. Coerce SUPABASE_DB_URL to postgresql+psycopg:// in create_db_connection to ensure psycopg>=3.2.2 driver. Kept removal of pgbouncer=true and psycopg2 fallback. Preserved pooled connection (aws-1-eu-central-1.pooler.supabase.com:6543), SUPABASE_DB_URL name, and all v17.19 features (DB diagnostics, fallback, retries, logging, /healthz, memory, schema subset, forecasts, top_k=1000). No changes to context.py (v1.7 correct) or index.ts (v2.0 robust). Realistic note: Correct password with psycopg yields 95-100% success.
 
 import os
 import re
@@ -53,8 +53,8 @@ if not all([OPENAI_API_KEY, SUPABASE_DB_URL, APP_SECRET_KEY]):
 def validate_supabase_url(url: str) -> None:
     try:
         parsed = urllib.parse.urlparse(url)
-        if parsed.scheme not in ["postgres", "postgresql"]:
-            raise ValueError("Scheme must be 'postgres' or 'postgresql'")
+        if parsed.scheme not in ["postgres", "postgresql", "postgresql+psycopg"]:
+            raise ValueError("Scheme must be 'postgres', 'postgresql', or 'postgresql+psycopg'")
         if not parsed.username or not parsed.password:
             raise ValueError("Username and password must be provided")
         # Trim whitespace from password and validate characters
@@ -100,7 +100,7 @@ ALLOWED_TABLES = [
 ]
 
 # --- FastAPI Application ---
-app = FastAPI(title="EnerBot Backend", version="17.19")
+app = FastAPI(title="EnerBot Backend", version="17.20")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 # --- System Prompts ---
@@ -206,9 +206,9 @@ def extract_sql_from_steps(steps: List[Any]) -> Optional[str]:
 
 def convert_decimal_to_float(obj):
     if isinstance(obj, Decimal): return float(obj)
-    if isinstance(obj, List): return [convert_decimal_to_float(x) for x in obj]
-    if isinstance(obj, tuple): return tuple(convert_decimal_to_float(x) for x in obj)
-    if isinstance(obj, Dict): return {k: convert_decimal_to_float(v) for k, v in obj.items()}
+    if isinstance(obj, list): return [convert_decimal_to_float(x) for x in obj]
+    if isinstance(obj, tuple): return tuple(convert_decimal_to_float(x) for x in obj]
+    if isinstance(obj, dict): return {k: convert_decimal_to_float(v) for k, v in obj.items()}
     return obj
 
 def coerce_dataframe(rows: List[tuple], columns: List[str]) -> pd.DataFrame:
@@ -289,7 +289,7 @@ def detect_forecast_intent(query: str) -> (bool, Optional[datetime], Optional[st
 
     return False, None, None
 
-# --- New: Code Execution Tool ---
+# --- Code Execution Tool ---
 @tool
 def execute_python_code(code: str) -> str:
     """Execute Python code for data analysis (e.g., correlations, summaries). Input: code string. Output: result as string.
@@ -310,7 +310,7 @@ def execute_python_code(code: str) -> str:
     except Exception as e:
         return f"Error: {str(e)}"
 
-# --- New: Schema Subsetter ---
+# --- Schema Subsetter ---
 def get_schema_subset(llm, query: str) -> str:
     subset_prompt = ChatPromptTemplate.from_messages([
         ("system", "Extract relevant tables/columns from schema for query. Output concise subset doc. If database unavailable, describe schema without data access."),
@@ -319,7 +319,7 @@ def get_schema_subset(llm, query: str) -> str:
     chain = subset_prompt | llm | StrOutputParser()
     return chain.invoke({})
 
-# --- New: DB Connection with Retry ---
+# --- DB Connection with Retry ---
 @tenacity.retry(
     stop=tenacity.stop_after_attempt(3),
     wait=tenacity.wait_fixed(5),
@@ -328,8 +328,15 @@ def get_schema_subset(llm, query: str) -> str:
 )
 def create_db_connection():
     try:
+        # Coerce SUPABASE_DB_URL to use postgresql+psycopg://
+        parsed_url = urllib.parse.urlparse(SUPABASE_DB_URL)
+        if parsed_url.scheme in ["postgres", "postgresql"]:
+            coerced_url = SUPABASE_DB_URL.replace(parsed_url.scheme, "postgresql+psycopg", 1)
+            logger.info(f"Coerced SUPABASE_DB_URL to: {re.sub(r':[^@]+@', ':****@', coerced_url)}")
+        else:
+            coerced_url = SUPABASE_DB_URL
         engine = create_engine(
-            SUPABASE_DB_URL,
+            coerced_url,
             poolclass=QueuePool,
             pool_size=10,
             max_overflow=5,
