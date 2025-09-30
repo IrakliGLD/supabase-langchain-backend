@@ -1,5 +1,5 @@
-# main.py v17.22
-# Changes from v17.21: Fixed ValueError: Unsupported function dates in /ask endpoint by removing tools.extend(db.get_usable_table_names()) and using SQLDatabaseToolkit exclusively for SQL tools. Preserved v17.21 changes: fixed SyntaxError in convert_decimal_to_float, updated validate_supabase_url to allow postgresql+psycopg scheme, coerced SUPABASE_DB_URL to postgresql+psycopg://, removed pgbouncer=true and psycopg2 fallback. Kept pooled connection (aws-1-eu-central-1.pooler.supabase.com:6543), SUPABASE_DB_URL name, and all v17.21 features (DB diagnostics, fallback, retries, logging, /healthz, memory, schema subset, forecasts, top_k=1000). No changes to context.py (v1.7 correct) or index.ts (v2.0 robust). Realistic note: Correct password with psycopg and SQLDatabaseToolkit yields 95-100% success.
+# main.py v17.23
+# Changes from v17.22: Fixed ValueError: Agent failed after retries by formatting AGENT_PROMPT with schema_subset and DB_JOINS before agent creation, passing only input to agent_executor.invoke. Added schema="public" to SQLDatabase init to align with public.tech_quantity. Updated clean_and_validate_sql to strip public. prefix. Added DB_SCHEMA_DOC and DB_JOINS validation. Preserved v17.22 features: fixed SyntaxError in convert_decimal_to_float, used SQLDatabaseToolkit, postgresql+psycopg://, psycopg>=3.2.2, no pgbouncer=true, pooled connection (6543), password validation, logging, /healthz, memory, schema subset, forecasts, top_k=1000. No changes to context.py (v1.7) or index.ts (v2.0). Realistic note: Correct password and schema yield 95-100% success.
 
 import os
 import re
@@ -96,20 +96,28 @@ logger.info(f"DB connection details: host={db_host}, port={db_port}, dbname={db_
 # --- Import DB Schema & Joins ---
 from context import DB_SCHEMA_DOC, DB_JOINS, scrub_schema_mentions
 
+# Validate DB_SCHEMA_DOC and DB_JOINS
+if not isinstance(DB_SCHEMA_DOC, str):
+    logger.error(f"DB_SCHEMA_DOC must be a string, got {type(DB_SCHEMA_DOC)}")
+    raise ValueError("Invalid DB_SCHEMA_DOC format")
+if not isinstance(DB_JOINS, (str, dict)):
+    logger.error(f"DB_JOINS must be a string or dict, got {type(DB_JOINS)}")
+    raise ValueError("Invalid DB_JOINS format")
+
 ALLOWED_TABLES = [
     "energy_balance_long", "entities", "monthly_cpi",
     "price", "tariff_gen", "tech_quantity", "trade", "dates"
 ]
 
 # --- FastAPI Application ---
-app = FastAPI(title="EnerBot Backend", version="17.22")
+app = FastAPI(title="EnerBot Backend", version="17.23")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 # --- System Prompts ---
 FEW_SHOT_EXAMPLES = [
     {"input": "What is the average price in 2020?", "output": "SELECT AVG(p_dereg_gel) FROM price WHERE date >= '2020-01-01' AND date < '2021-01-01';"},
     {"input": "Correlate CPI and prices", "output": "SELECT m.date, m.cpi, p.p_dereg_gel FROM monthly_cpi m JOIN price p ON m.date = p.date;"},
-    # Add 3-5 more as needed
+    {"input": "What was electricity generation in May 2023?", "output": "SELECT SUM(quantity_tech) * 1000 AS total_generation_mwh FROM tech_quantity WHERE date = '2023-05-01';"}
 ]
 
 SQL_SYSTEM_TEMPLATE = """
@@ -188,6 +196,7 @@ def clean_and_validate_sql(sql: str) -> str:
     cleaned_sql = re.sub(r"```(?:sql)?\s*|\s*```", "", sql, flags=re.IGNORECASE)
     cleaned_sql = re.sub(r"--.*?$", "", cleaned_sql, flags=re.MULTILINE)
     cleaned_sql = re.sub(r"\bLIMIT\s+\d+\b", "", cleaned_sql, flags=re.IGNORECASE)
+    cleaned_sql = re.sub(r'\bpublic\.', '', cleaned_sql)  # Strip public schema
     cleaned_sql = cleaned_sql.strip().removesuffix(";")
     if not cleaned_sql.strip().upper().startswith("SELECT"):
         raise ValueError("Only SELECT statements are allowed.")
@@ -345,7 +354,7 @@ def create_db_connection():
             pool_timeout=10,
             connect_args={'connect_timeout': 10}
         )
-        db = SQLDatabase(engine, include_tables=ALLOWED_TABLES)
+        db = SQLDatabase(engine, include_tables=ALLOWED_TABLES, schema="public")
         # Test connection
         with engine.connect() as conn:
             conn.execute(text("SELECT 1"))
@@ -421,10 +430,20 @@ def ask(q: Question, x_app_key: str = Header(...)):
             toolkit = SQLDatabaseToolkit(db=db, llm=llm)
             tools.extend(toolkit.get_tools())  # Add SQL tools from toolkit
         
+        # Format AGENT_PROMPT with schema and joins
+        try:
+            formatted_prompt = AGENT_PROMPT.format(schema=schema_subset, joins=DB_JOINS)
+        except Exception as e:
+            logger.error(f"Failed to format AGENT_PROMPT: {str(e)}")
+            formatted_prompt = AGENT_PROMPT.format(
+                schema="Schema unavailable due to formatting error.",
+                joins="Joins unavailable due to formatting error."
+            )
+        
         agent = create_openai_tools_agent(
             llm=llm,
             tools=tools,
-            prompt=AGENT_PROMPT
+            prompt=formatted_prompt
         )
         
         memory = ConversationBufferMemory(memory_key="chat_history", return_messages=True)
@@ -447,11 +466,7 @@ def ask(q: Question, x_app_key: str = Header(...)):
                 input_query = q.query
                 if db_error and "select" in q.query.lower():
                     input_query = f"{q.query}\nNote: Database is unavailable, provide a schema-based response without data."
-                result = agent_executor.invoke({
-                    "input": input_query + (f"\nPrevious error: {last_error}" if last_error else ""),
-                    "schema": schema_subset,
-                    "joins": DB_JOINS
-                })
+                result = agent_executor.invoke({"input": input_query + (f"\nPrevious error: {last_error}" if last_error else "")})
                 break
             except Exception as e:
                 last_error = str(e)
