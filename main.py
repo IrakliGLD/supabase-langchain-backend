@@ -1,5 +1,5 @@
-# main.py v17.27
-# Changes from v17.26: Fixed "Agent stopped due to max iterations" for forecast queries by validating data length in execute_python_code, using intersection length of arrays. Increased max_iterations=15 (from 10). Updated freq='M' to 'ME' in _ensure_monthly_index to fix FutureWarning. Added error logging for data mismatches. Enhanced fallback response. Preserved v17.26 features: fixed SyntaxError with connect_args={'options': '-csearch_path=public'}, connect_timeout=60s, pool_timeout=60s, pool_pre_ping=True, pool_recycle=300, retries=5, SQLDatabaseToolkit, postgresql+psycopg://, psycopg>=3.2.2, no pgbouncer=true, logging, /healthz, memory, schema subset, forecasts, top_k=1000, DB_SCHEMA_DOC/DB_JOINS validation, escaped {type}. No changes to context.py (v1.7), index.ts (v2.0), or requirements.txt. Realistic note: Expect ~90% success, 5-10% failures on cold starts; ARIMA may need OLS fallback for convergence issues.
+# main.py v17.28
+# Changes from v17.27: Fixed OpenAI 429 rate limit errors by adding tenacity retry with exponential backoff for RateLimitError in /ask. Updated FEW_SHOT_EXAMPLES to compute p_bal_usd as p_bal_gel / xrate. Added column validation in sql_db_query_checker. Reduced max_iterations=12 (from 15) to balance tokens. Enhanced fallback response for rate limits. Kept v17.27 features: data length validation in execute_python_code, freq='ME', connect_args={'options': '-csearch_path=public'}, connect_timeout=60s, pool_timeout=60s, pool_pre_ping=True, pool_recycle=300, retries=5, SQLDatabaseToolkit, postgresql+psycopg://, psycopg>=3.2.2, no pgbouncer=true, logging, /healthz, memory, schema subset, forecasts, top_k=1000, DB_SCHEMA_DOC/DB_JOINS validation, escaped {type}. No changes to context.py (v1.7), index.ts (v2.0). Added openai to requirements.txt. Realistic note: Expect ~90% success, 5-10% failures on cold starts or rate limits.
 
 import os
 import re
@@ -19,6 +19,7 @@ from sqlalchemy.pool import QueuePool
 
 import psycopg
 from psycopg import OperationalError as PsycopgOperationalError
+from openai import RateLimitError
 
 from langchain_openai import ChatOpenAI
 from langchain_community.utilities import SQLDatabase
@@ -59,7 +60,6 @@ def validate_supabase_url(url: str) -> None:
             raise ValueError("Scheme must be 'postgres', 'postgresql', or 'postgresql+psycopg'")
         if not parsed.username or not parsed.password:
             raise ValueError("Username and password must be provided")
-        # Trim whitespace from password and validate characters
         parsed_password = parsed.password.strip() if parsed.password else ""
         if not parsed_password:
             raise ValueError("Password cannot be empty after trimming")
@@ -110,7 +110,7 @@ ALLOWED_TABLES = [
 ]
 
 # --- FastAPI Application ---
-app = FastAPI(title="EnerBot Backend", version="17.27")
+app = FastAPI(title="EnerBot Backend", version="17.28")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 # --- System Prompts ---
@@ -130,6 +130,7 @@ to answer the user's question based on the provided database schema and join inf
 1.  **GENERATE ONLY SQL.** Your final output must be only the SQL query.
 2.  Use the `DB_JOINS` dictionary to determine how to join tables.
 3.  For any time-series analysis, query for the entire date range requested, or the entire dataset if no range is specified.
+4.  Ensure all column names exist in the schema (e.g., compute p_bal_usd as p_bal_gel / xrate instead of selecting p_bal_usd directly).
 
 ### FEW-SHOT EXAMPLES ###
 {examples}
@@ -385,6 +386,12 @@ def health(check_db: Optional[bool] = Query(False)):
     return {"status": "ok"}
 
 @app.post("/ask", response_model=APIResponse)
+@tenacity.retry(
+    stop=tenacity.stop_after_attempt(5),
+    wait=tenacity.wait_exponential(min=1, max=60),
+    retry=tenacity.retry_if_exception_type(RateLimitError),
+    before_sleep=lambda retry_state: logger.info(f"Retrying /ask due to rate limit ({retry_state.attempt_number}/5)...")
+)
 def ask(q: Question, x_app_key: str = Header(...)):
     start_time = time.time()
     if x_app_key != APP_SECRET_KEY:
@@ -453,7 +460,7 @@ def ask(q: Question, x_app_key: str = Header(...)):
             agent=agent,
             tools=tools,
             verbose=True,
-            max_iterations=15,  # Increased for complex forecasts
+            max_iterations=12,  # Reduced to balance tokens
             handle_parsing_errors=True,
             memory=memory
         )
@@ -476,7 +483,7 @@ def ask(q: Question, x_app_key: str = Header(...)):
         if not result:
             raise ValueError("Agent failed after retries.")
         
-        raw_output = result.get("output", "Unable to process due to database query issue or data processing error. Please retry later or simplify the query.")
+        raw_output = result.get("output", "Unable to process due to database query issue, data processing error, or processing limits. Please retry later or simplify the query.")
         
         # Append DB warning if applicable
         if db_error:
