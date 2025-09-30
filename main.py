@@ -1,5 +1,5 @@
-# main.py v17.29
-# Changes from v17.28: Implemented forecasting instructions: p_bal_gel/p_bal_usd (yearly/summer/winter averages) from price, demand (total/Abkhazeti/others) from tech_quantity, demand by energy_source/sector from energy_balance_long. Blocked p_dereg_gel, p_gcap_gel, tariff_gel with user reasons. Fixed data length mismatches in execute_python_code using SQL result lengths. Optimized SQL_SYSTEM_TEMPLATE and AGENT_PROMPT to reduce tokens/iterations. Kept RateLimitError retries, max_iterations=12, freq='ME', connect_args={'options': '-csearch_path=public'}, connect_timeout=60s, pool_timeout=60s, pool_pre_ping=True, pool_recycle=300, retries=5, SQLDatabaseToolkit, postgresql+psycopg://, psycopg>=3.2.2, no pgbouncer=true, logging, /healthz, memory, top_k=1000, DB_SCHEMA_DOC/DB_JOINS validation, openai>=1.0.0. No changes to context.py (v1.7), index.ts (v2.0). Realistic: ~90% success, 5-10% cold start failures.
+# main.py v17.30
+# Changes from v17.29: Fixed INVALID_PROMPT_INPUT error by escaping {type} as {{type}} in AGENT_PROMPT. Kept forecasting instructions: p_bal_gel/p_bal_usd (yearly/summer/winter averages) from price, demand (total/Abkhazeti/others) from tech_quantity, demand by energy_source/sector from energy_balance_long, blocked p_dereg_gel/p_gcap_gel/tariff_gel. Preserved data length validation, max_iterations=12, RateLimitError retries, freq='ME', connect_args={'options': '-csearch_path=public'}, connect_timeout=60s, pool_timeout=60s, pool_pre_ping=True, pool_recycle=300, SQLDatabaseToolkit, postgresql+psycopg://, psycopg>=3.2.2, no pgbouncer=true, logging, /healthz, memory, top_k=1000, DB_SCHEMA_DOC/DB_JOINS validation, openai>=1.0.0. Added prompt error logging. No changes to context.py (v1.7), index.ts (v2.0). Realistic: ~90% success, 5-10% cold start failures.
 
 import os
 import re
@@ -114,7 +114,7 @@ ALLOWED_TABLES = [
 schema_cache = {}
 
 # --- FastAPI Application ---
-app = FastAPI(title="EnerBot Backend", version="17.29")
+app = FastAPI(title="EnerBot Backend", version="17.30")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 # --- System Prompts ---
@@ -176,7 +176,7 @@ AGENT_PROMPT = ChatPromptTemplate.from_messages([
     - Forecast only: balancing electricity prices (p_bal_gel, p_bal_usd as p_bal_gel / xrate) from price table (yearly, summer May-Aug, winter Sep-Apr averages); demand (total, Abkhazeti, others) from tech_quantity, excluding export; demand by energy_source/sector from energy_balance_long.
     - Block forecasts for p_dereg_gel (politically driven), p_gcap_gel (GNERC-regulated), tariff_gel (GNERC-regulated) with user-friendly reasons.
     - Use exact SQL result lengths for DataFrame creation in execute_python_code.
-    - For visualization, output JSON (e.g., {'type': 'line', 'data': [...]}).
+    - For visualization, output JSON (e.g., {{'type': 'line', 'data': [...]}}).
     - If database unavailable, provide schema-based response.
     
     Schema: {schema}
@@ -463,7 +463,7 @@ def ask(q: Question, x_app_key: str = Header(...)):
                 examples=examples_str
             )
         except Exception as e:
-            logger.error(f"Failed to format SQL prompt: {e}")
+            logger.error(f"Failed to format SQL prompt: {str(e)}", exc_info=True)
             sql_system_message = SQL_SYSTEM_TEMPLATE.format(
                 schema_subset=schema_subset,
                 DB_JOINS=DB_JOINS,
@@ -485,7 +485,7 @@ def ask(q: Question, x_app_key: str = Header(...)):
         try:
             partial_prompt = AGENT_PROMPT.partial(schema=schema_subset, joins=DB_JOINS)
         except Exception as e:
-            logger.error(f"Failed to format AGENT_PROMPT with partial: {str(e)}")
+            logger.error(f"Failed to format AGENT_PROMPT: {str(e)}", exc_info=True)
             partial_prompt = AGENT_PROMPT.partial(
                 schema="Schema unavailable due to formatting error.",
                 joins="Joins unavailable due to formatting error."
@@ -647,5 +647,5 @@ def ask(q: Question, x_app_key: str = Header(...)):
             execution_time=round(time.time() - start_time, 2)
         )
     except Exception as e:
-        logger.error(f"FATAL error in /ask endpoint: {e}", exc_info=True)
+        logger.error(f"FATAL error in /ask endpoint: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail="An internal processing error occurred.")
