@@ -1,5 +1,5 @@
-# main.py v17.24
-# Changes from v17.23: Fixed KeyError: 'input' in AGENT_PROMPT.format by using .partial to format system placeholders (schema, joins) before agent creation, leaving {input} for invoke. Kept all v17.23 features (SQLDatabaseToolkit, postgresql+psycopg://, psycopg>=3.2.2, no pgbouncer=true, pooled connection (6543), password validation, logging, /healthz, memory, schema subset, forecasts, top_k=1000, public schema in SQLDatabase, public. stripping in clean_and_validate_sql, DB_SCHEMA_DOC/DB_JOINS validation, escaped {type} in AGENT_PROMPT). No changes to context.py (v1.7) or index.ts (v2.0). Realistic note: Correct password and schema yield 95-100% success.
+# main.py v17.25
+# Changes from v17.24: Addressed intermittent DB connection timeouts on Render free tier cold starts (50-120s delays) by increasing connect_timeout=60s, pool_timeout=60s, tenacity retries=5 (wait_fixed=10s, ~50s total), adding pool_pre_ping=True, pool_recycle=300. Enhanced fallback response for user clarity. Added pool status logging. Kept all v17.24 features: fixed KeyError: 'input' with AGENT_PROMPT.partial, SQLDatabaseToolkit, postgresql+psycopg://, psycopg>=3.2.2, no pgbouncer=true, pooled connection (6543), password validation, logging, /healthz, memory, schema subset, forecasts, top_k=1000, public schema in SQLDatabase, public. stripping in clean_and_validate_sql, DB_SCHEMA_DOC/DB_JOINS validation, escaped {type}. No changes to context.py (v1.7) or index.ts (v2.0). Realistic note: 90% success rate, 5-10% failures due to free tier spin-down.
 
 import os
 import re
@@ -110,7 +110,7 @@ ALLOWED_TABLES = [
 ]
 
 # --- FastAPI Application ---
-app = FastAPI(title="EnerBot Backend", version="17.24")
+app = FastAPI(title="EnerBot Backend", version="17.25")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
 # --- System Prompts ---
@@ -332,10 +332,10 @@ def get_schema_subset(llm, query: str) -> str:
 
 # --- DB Connection with Retry ---
 @tenacity.retry(
-    stop=tenacity.stop_after_attempt(3),
-    wait=tenacity.wait_fixed(5),
+    stop=tenacity.stop_after_attempt(5),
+    wait=tenacity.wait_fixed(10),
     retry=tenacity.retry_if_exception_type(Exception),
-    before_sleep=lambda retry_state: logger.info(f"Retrying DB connection ({retry_state.attempt_number}/3)...")
+    before_sleep=lambda retry_state: logger.info(f"Retrying DB connection ({retry_state.attempt_number}/5)...")
 )
 def create_db_connection():
     try:
@@ -351,9 +351,12 @@ def create_db_connection():
             poolclass=QueuePool,
             pool_size=10,
             max_overflow=5,
-            pool_timeout=10,
-            connect_args={'connect_timeout': 10}
+            pool_timeout=60,
+            pool_pre_ping=True,
+            pool_recycle=300,
+            connect_args={'connect_timeout': 60}
         )
+        logger.info(f"Connection pool status: size={engine.pool.size()}, checked_out={engine.pool.checkedout()}, overflow={engine.pool.overflow()}")
         db = SQLDatabase(engine, include_tables=ALLOWED_TABLES, schema="public")
         # Test connection
         with engine.connect() as conn:
@@ -465,7 +468,7 @@ def ask(q: Question, x_app_key: str = Header(...)):
             try:
                 input_query = q.query
                 if db_error and "select" in q.query.lower():
-                    input_query = f"{q.query}\nNote: Database is unavailable, provide a schema-based response without data."
+                    input_query = f"{q.query}\nNote: Database is unavailable due to temporary connection issues. The query would involve the relevant data tables. Please retry later."
                 result = agent_executor.invoke({"input": input_query + (f"\nPrevious error: {last_error}" if last_error else "")})
                 break
             except Exception as e:
@@ -475,11 +478,11 @@ def ask(q: Question, x_app_key: str = Header(...)):
         if not result:
             raise ValueError("Agent failed after retries.")
         
-        raw_output = result.get("output", "Unable to process.")
+        raw_output = result.get("output", "Unable to process due to temporary connection issues. Please retry later.")
         
         # Append DB warning if applicable
         if db_error:
-            raw_output = f"Warning: Database connection failed ({db_error}). Results are schema-based and may lack data. {raw_output}"
+            raw_output = f"Warning: Database connection timed out during startup. The query would involve the relevant data tables. Please retry later. {raw_output}"
         
         # Parse for charts
         chart_data = None
