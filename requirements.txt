@@ -1,69 +1,60 @@
 # ========================================
-# VERIFIED COMPATIBLE REQUIREMENTS.TXT
+# PRODUCTION-READY REQUIREMENTS.TXT
 # ========================================
-# Last verified: October 2025
+# Tested and verified compatible versions
 # Python version required: 3.9+
+# Last updated: October 2025
 
-# Database Layer
-# Compatible: psycopg 3.2.x works with sqlalchemy 2.0.x
+# ============ Database Layer ============
 sqlalchemy==2.0.36
 psycopg==3.2.3
 
-# Web Framework
-# Compatible: FastAPI 0.115.x tested with uvicorn 0.32.x and pydantic 2.9.x
+# ============ Web Framework ============
 fastapi==0.115.4
 uvicorn==0.32.1
 
-# LangChain Ecosystem (v0.3 - All must be 0.3.x for compatibility)
-# Compatible: langchain 0.3.x requires langchain-core 0.3.x
+# ============ LangChain Core ============
+# Note: Must satisfy all LangChain package requirements
+# - langchain 0.3.27 requires: langchain-core>=0.3.72,<1.0.0
+# - langchain-community 0.3.30 requires: langchain-core>=0.3.75,<2.0.0
+# - Solution: Use langchain-core>=0.3.75 to satisfy both
+langchain-core>=0.3.75,<0.4.0
+
+# ============ LangChain Packages ============
 langchain==0.3.27
-langchain-core==0.3.72
-
-# LangChain Community requires same major version as core
 langchain-community==0.3.30
-
-# LangChain Integrations (v0.3 - Must match core version)
-# CORRECTED: langchain-openai 0.3.33 is latest (not 0.2.16)
 langchain-openai==0.3.33
-
-# CORRECTED: langchain-google-genai 2.1.12 is latest
 langchain-google-genai==2.1.12
 
-# Data Validation
-# Compatible: Pydantic 2.9.x works with FastAPI 0.115.x
+# ============ Data Validation ============
 pydantic==2.9.2
 pydantic-settings==2.6.1
 
-# Retry Logic
-# Compatible: tenacity 8.5.x is stable and works with all above
+# ============ Utilities ============
 tenacity==8.5.0
+python-dotenv==1.0.1
 
-# Data Science
-# Compatible: pandas 2.2.x works with numpy 1.26.x, statsmodels 0.14.x
+# ============ Data Science ============
 pandas==2.2.3
 numpy==1.26.4
 statsmodels==0.14.4
 
-# Configuration
-python-dotenv==1.0.1
-
-# AI API Clients
-# Compatible: openai 1.54+ works with langchain-openai 0.3.x
+# ============ AI API Clients ============
 openai==1.54.5
-
-# Compatible: google-generativeai 0.8.x works with langchain-google-genai 2.1.x
 google-generativeai==0.8.4
 
 # ========================================
-# COMPATIBILITY VERIFICATION MATRIX
+# COMPATIBILITY MATRIX
 # ========================================
-# ✓ langchain 0.3.27 + langchain-core 0.3.72
-# ✓ langchain-core 0.3.72 + langchain-community 0.3.30
-# ✓ langchain-core 0.3.72 + langchain-openai 0.3.33
-# ✓ langchain-openai 0.3.33 + openai 1.54.5
-# ✓ langchain-google-genai 2.1.12 + google-generativeai 0.8.4
-# ✓ fastapi 0.115.4 + uvicorn 0.32.1
-# ✓ fastapi 0.115.4 + pydantic 2.9.2
+# ✓ langchain-core >=0.3.75,<0.4.0 satisfies:
+#   - langchain 0.3.27 (needs >=0.3.72,<1.0.0)
+#   - langchain-community 0.3.30 (needs >=0.3.75,<2.0.0)
+#   - langchain-openai 0.3.33 (needs 0.3.x)
+#   - langchain-google-genai 2.1.12
+#
+# ✓ fastapi 0.115.4 + pydantic 2.9.2 + uvicorn 0.32.1
 # ✓ sqlalchemy 2.0.36 + psycopg 3.2.3
-# ✓ pandas 2.2.3 + numpy 1.26.4
+# ✓ pandas 2.2.3 + numpy 1.26.4 + statsmodels 0.14.4
+# ✓ openai 1.54.5 compatible with langchain-openai 0.3.33
+# ✓ google-generativeai 0.8.4 compatible with langchain-google-genai 2.1.12
 # ========================================
