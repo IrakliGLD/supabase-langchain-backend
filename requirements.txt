@@ -5,7 +5,7 @@ uvicorn==0.32.0
 langchain==0.3.2
 langchain-openai==0.2.2
 langchain-community==0.3.1
-langchain-core==0.3.8
+langchain-core
 pydantic==2.9.2
 tenacity==8.5.0
 pandas==2.2.3
