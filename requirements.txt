@@ -1,29 +1,31 @@
-# Database / ORM
+# Database
 sqlalchemy==2.0.36
-psycopg==3.2.2
+psycopg==3.2.3
 
-# Web / API
-fastapi==0.115.2
-uvicorn==0.32.0
+# Web Framework
+fastapi==0.116.1
+uvicorn==0.34.0
 
-# LangChain and its modules — unified version
-langchain==0.3.68
-langchain-core==0.3.68
-langchain-openai==0.3.28
-langchain-community==0.3.68
+# LangChain Core (Updated to 0.3.x)
+langchain==0.3.27
+langchain-core==0.3.72
+langchain-community==0.3.30
+langchain-openai==0.2.16
+langchain-google-genai==2.0.9
 
-# Core dependencies
-pydantic==2.7.0
-tenacity==8.5.0
+# Data Validation
+pydantic==2.10.6
+pydantic-settings==2.7.1
 
-# Data / scientific libs
-pandas==2.2.3
-numpy==1.26.4
-statsmodels==0.14.4
-
+# Utilities
+tenacity==9.0.0
 python-dotenv==1.0.1
 
-# AI / SDK / integrations
-openai==0.28.1
-google-generativeai==0.7.2
-langchain-google-genai==2.0.0
+# Data Science
+pandas==2.2.3
+numpy==2.2.3
+statsmodels==0.14.4
+
+# AI APIs
+openai==1.98.0
+google-generativeai==0.8.4
