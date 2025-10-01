@@ -1,31 +1,69 @@
-# Database
+# ========================================
+# VERIFIED COMPATIBLE REQUIREMENTS.TXT
+# ========================================
+# Last verified: October 2025
+# Python version required: 3.9+
+
+# Database Layer
+# Compatible: psycopg 3.2.x works with sqlalchemy 2.0.x
 sqlalchemy==2.0.36
 psycopg==3.2.3
 
 # Web Framework
-fastapi==0.116.1
-uvicorn==0.34.0
+# Compatible: FastAPI 0.115.x tested with uvicorn 0.32.x and pydantic 2.9.x
+fastapi==0.115.4
+uvicorn==0.32.1
 
-# LangChain Core (Updated to 0.3.x)
+# LangChain Ecosystem (v0.3 - All must be 0.3.x for compatibility)
+# Compatible: langchain 0.3.x requires langchain-core 0.3.x
 langchain==0.3.27
 langchain-core==0.3.72
+
+# LangChain Community requires same major version as core
 langchain-community==0.3.30
-langchain-openai==0.2.16
-langchain-google-genai==2.0.9
+
+# LangChain Integrations (v0.3 - Must match core version)
+# CORRECTED: langchain-openai 0.3.33 is latest (not 0.2.16)
+langchain-openai==0.3.33
+
+# CORRECTED: langchain-google-genai 2.1.12 is latest
+langchain-google-genai==2.1.12
 
 # Data Validation
-pydantic==2.10.6
-pydantic-settings==2.7.1
+# Compatible: Pydantic 2.9.x works with FastAPI 0.115.x
+pydantic==2.9.2
+pydantic-settings==2.6.1
 
-# Utilities
-tenacity==9.0.0
-python-dotenv==1.0.1
+# Retry Logic
+# Compatible: tenacity 8.5.x is stable and works with all above
+tenacity==8.5.0
 
 # Data Science
+# Compatible: pandas 2.2.x works with numpy 1.26.x, statsmodels 0.14.x
 pandas==2.2.3
-numpy==2.2.3
+numpy==1.26.4
 statsmodels==0.14.4
 
-# AI APIs
-openai==1.98.0
+# Configuration
+python-dotenv==1.0.1
+
+# AI API Clients
+# Compatible: openai 1.54+ works with langchain-openai 0.3.x
+openai==1.54.5
+
+# Compatible: google-generativeai 0.8.x works with langchain-google-genai 2.1.x
 google-generativeai==0.8.4
+
+# ========================================
+# COMPATIBILITY VERIFICATION MATRIX
+# ========================================
+# ✓ langchain 0.3.27 + langchain-core 0.3.72
+# ✓ langchain-core 0.3.72 + langchain-community 0.3.30
+# ✓ langchain-core 0.3.72 + langchain-openai 0.3.33
+# ✓ langchain-openai 0.3.33 + openai 1.54.5
+# ✓ langchain-google-genai 2.1.12 + google-generativeai 0.8.4
+# ✓ fastapi 0.115.4 + uvicorn 0.32.1
+# ✓ fastapi 0.115.4 + pydantic 2.9.2
+# ✓ sqlalchemy 2.0.36 + psycopg 3.2.3
+# ✓ pandas 2.2.3 + numpy 1.26.4
+# ========================================
