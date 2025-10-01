@@ -5,13 +5,13 @@ uvicorn==0.32.0
 langchain==0.3.2
 langchain-openai==0.2.2
 langchain-community==0.3.1
-langchain-core
+langchain-core==0.3.8
 pydantic==2.9.2
 tenacity==8.5.0
 pandas==2.2.3
 numpy==1.26.4
 statsmodels==0.14.4
 python-dotenv==1.0.1
-openai
-google-generativeai==0.8.0
+openai==1.40.0
+google-generativeai==0.8.2
 langchain-google-genai==1.0.10
