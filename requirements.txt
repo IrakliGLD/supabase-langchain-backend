@@ -1,60 +1,17 @@
-# ========================================
-# PRODUCTION-READY REQUIREMENTS.TXT
-# ========================================
-# Tested and verified compatible versions
-# Python version required: 3.9+
-# Last updated: October 2025
-
-# ============ Database Layer ============
 sqlalchemy==2.0.36
-psycopg==3.2.3
-
-# ============ Web Framework ============
-fastapi==0.115.4
-uvicorn==0.32.1
-
-# ============ LangChain Core ============
-# Note: Must satisfy all LangChain package requirements
-# - langchain 0.3.27 requires: langchain-core>=0.3.72,<1.0.0
-# - langchain-community 0.3.30 requires: langchain-core>=0.3.75,<2.0.0
-# - Solution: Use langchain-core>=0.3.75 to satisfy both
-langchain-core>=0.3.75,<0.4.0
-
-# ============ LangChain Packages ============
-langchain==0.3.27
-langchain-community==0.3.30
-langchain-openai==0.3.33
-langchain-google-genai==2.1.12
-
-# ============ Data Validation ============
+psycopg==3.2.2
+fastapi==0.115.2
+uvicorn==0.32.0
+langchain==0.2.16
+langchain-openai==0.1.22
+langchain-community==0.2.16
+langchain-core==0.2.38
 pydantic==2.9.2
-pydantic-settings==2.6.1
-
-# ============ Utilities ============
 tenacity==8.5.0
-python-dotenv==1.0.1
-
-# ============ Data Science ============
 pandas==2.2.3
 numpy==1.26.4
 statsmodels==0.14.4
-
-# ============ AI API Clients ============
-openai==1.54.5
-google-generativeai==0.8.4
-
-# ========================================
-# COMPATIBILITY MATRIX
-# ========================================
-# ✓ langchain-core >=0.3.75,<0.4.0 satisfies:
-#   - langchain 0.3.27 (needs >=0.3.72,<1.0.0)
-#   - langchain-community 0.3.30 (needs >=0.3.75,<2.0.0)
-#   - langchain-openai 0.3.33 (needs 0.3.x)
-#   - langchain-google-genai 2.1.12
-#
-# ✓ fastapi 0.115.4 + pydantic 2.9.2 + uvicorn 0.32.1
-# ✓ sqlalchemy 2.0.36 + psycopg 3.2.3
-# ✓ pandas 2.2.3 + numpy 1.26.4 + statsmodels 0.14.4
-# ✓ openai 1.54.5 compatible with langchain-openai 0.3.33
-# ✓ google-generativeai 0.8.4 compatible with langchain-google-genai 2.1.12
-# ========================================
+python-dotenv==1.0.1
+openai==1.40.0
+google-generativeai==0.7.2
+langchain-google-genai==0.0.11
